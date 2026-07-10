@@ -1,0 +1,12 @@
+# CDK
+cdk/cdk.out/
+cdk/node_modules/
+*.js
+!bin/*.js
+*.d.ts
+
+# Node
+node_modules/
+
+# Go
+/out/

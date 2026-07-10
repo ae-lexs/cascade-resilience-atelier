@@ -1,0 +1,10 @@
+# Asset context is the repo root (CDK fromAsset('..')). Exclude the CDK
+# output/deps so the container-asset staging does not recurse into cdk.out
+# (which lives at cdk/cdk.out, inside this same context) → ENAMETOOLONG.
+cdk/cdk.out
+cdk/node_modules
+**/node_modules
+.git
+.gitignore
+docker
+docker-compose.yml

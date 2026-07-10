@@ -1,0 +1,16 @@
+services:
+  build:
+    image: golang:1.22-alpine
+    working_dir: /work/app
+    volumes: [".:/work"]
+
+  cdk:
+    build: { context: ., dockerfile: docker/cdk.Dockerfile }
+    working_dir: /work/cdk
+    volumes:
+      - ".:/work"
+      - "${HOME}/.aws:/root/.aws:rw"          # :rw — SSO token refresh writes here
+      - "/var/run/docker.sock:/var/run/docker.sock"  # CDK asset build
+    environment:
+      AWS_PROFILE: cascade-resilience-atelier
+      CDK_DEFAULT_REGION: us-east-1
