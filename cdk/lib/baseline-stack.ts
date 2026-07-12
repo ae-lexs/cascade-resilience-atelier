@@ -4,6 +4,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as rds from 'aws-cdk-lib/aws-rds';
+import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 
 export class BaselineStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -38,7 +39,7 @@ export class BaselineStack extends cdk.Stack {
       securityGroups: [dbSg],
       multiAz: false,
       allocatedStorage: 20,
-      databaseName: 'cascade',
+      databaseName: 'cascadedb', // 'cascade' is a reserved word for the Postgres engine
       credentials: rds.Credentials.fromGeneratedSecret('cascade_app'), // user + generated password in Secrets Manager
       removalPolicy: cdk.RemovalPolicy.DESTROY, // teaching env: destroy cleanly
       backupRetention: cdk.Duration.days(0),
@@ -50,13 +51,15 @@ export class BaselineStack extends cdk.Stack {
     const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', { cpu: 256, memoryLimitMiB: 512 });
 
     const container = taskDef.addContainer('service', {
-      image: ecs.ContainerImage.fromAsset('..', { file: 'Dockerfile' }), // builds app/ from repo root
+      // Pin to linux/amd64 so the image matches Fargate's default X86_64
+      // platform regardless of build host (e.g. Apple Silicon arm64).
+      image: ecs.ContainerImage.fromAsset('..', { file: 'Dockerfile', platform: Platform.LINUX_AMD64 }),
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'cascade' }),
       environment: {
         SERVICE_ROLE: 'edge',
         DB_HOST: db.instanceEndpoint.hostname,
         DB_PORT: cdk.Token.asString(db.instanceEndpoint.port),
-        DB_NAME: 'cascade',
+        DB_NAME: 'cascadedb',
         DB_USER: 'cascade_app',
       },
       secrets: {
