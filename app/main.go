@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -18,14 +19,14 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	// Password is injected as a secret; everything else is plain env.
-	dsn := fmt.Sprintf(
-		"postgres://%s:%s@%s:%s/%s",
-		os.Getenv("DB_USER"),
-		os.Getenv("DB_PASSWORD"),
-		os.Getenv("DB_HOST"),
-		os.Getenv("DB_PORT"),
-		os.Getenv("DB_NAME"),
-	)
+	// Build the DSN via net/url so the generated password (which can contain
+	// URL-reserved chars like ^ = ,) is percent-encoded correctly.
+	dsn := (&url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD")),
+		Host:   net.JoinHostPort(os.Getenv("DB_HOST"), os.Getenv("DB_PORT")),
+		Path:   os.Getenv("DB_NAME"),
+	}).String()
 
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
