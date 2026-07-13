@@ -1,8 +1,10 @@
-# CDK
+# CDK (ignore compiled TS output, keep hand-written sources)
 cdk/cdk.out/
 cdk/node_modules/
 *.js
 !bin/*.js
+# k6 load harness is source, not compiled output
+!loadtest/*.js
 *.d.ts
 
 # Node
@@ -10,3 +12,5 @@ node_modules/
 
 # Go
 /out/
+# compiled binary from `go build`
+/app/app
