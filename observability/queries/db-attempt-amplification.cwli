@@ -1,0 +1,13 @@
+# db-attempt-amplification.cwli
+# Run over the app container log group (awslogs streamPrefix 'cascade', i.e.
+# the CascadeBaseline ...TaskDefserviceLogGroup...).
+#
+# Distinct requests are counted EXACTLY via group-by-then-count. Do NOT use
+# count_distinct(request_id): CloudWatch Logs Insights makes count_distinct
+# APPROXIMATE above ~10k distinct values, which under-counts the denominator and
+# inflates amplification (baseline read ~1.09 instead of 1.0, and every
+# experiment would be distorted proportionally). Verified 2026-07-12: exact = 1.0.
+filter event = "db_attempt"
+| stats count(*) as n by request_id
+| stats sum(n) as attempts, count(*) as requests
+| display attempts / requests as amplification

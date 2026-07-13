@@ -1,0 +1,34 @@
+# instance-replacement.cwli — Instance-replacement count   [Module 05]
+#
+# SOURCE: ECS task state-change events (EventBridge: source "aws.ecs",
+# detail-type "ECS Task State Change"). NOT app logs, and NOT in CloudWatch Logs
+# by default — see Option B to make them Logs-Insights-queryable.
+#
+# A "replacement" = one task STOPPED and the service relaunched a new one to hold
+# desiredCount (a STOPPED -> new RUNNING transition) inside the fault window.
+#
+# Method (runnable now, no extra infra): count stops via the ECS API.
+# Verified 2026-07-12 against the live cluster — returns 0 at steady state.
+#
+#   CL=$(aws ecs list-clusters --profile cascade-resilience-atelier --region us-east-1 \
+#          --query 'clusterArns[?contains(@,`CascadeBaseline`)]|[0]' --output text)
+#
+# Quick count (prints a number even when zero — the plain scan below prints
+# nothing at steady state, which looks like a failure but just means 0):
+#   aws ecs list-tasks --cluster "$CL" --desired-status STOPPED \
+#     --profile cascade-resilience-atelier --region us-east-1 --query 'length(taskArns)' --output text
+#
+# Detail (during/after a fault — shows each stop's reason + timestamps):
+#   aws ecs list-tasks --cluster "$CL" --desired-status STOPPED \
+#     --profile cascade-resilience-atelier --region us-east-1 --query 'taskArns' --output text \
+#   | xargs -n100 aws ecs describe-tasks --cluster "$CL" \
+#       --profile cascade-resilience-atelier --region us-east-1 --tasks \
+#       --query 'tasks[].{stoppedAt:stoppedAt,startedAt:startedAt,reason:stoppedReason}'
+#   # replacement count = number of tasks whose stoppedAt falls inside the fault
+#   # window. (ECS only retains stopped tasks for ~1h, so read this promptly.)
+#
+# Note: the authoritative event stream is EventBridge "ECS Task State Change"
+# (source aws.ecs). If Module 05 wants a Logs-Insights count instead of the API
+# scan above, add an EventBridge rule -> CloudWatch Logs group THEN, and write
+# the query against that log group at that point — not committed here since the
+# routing doesn't exist yet.

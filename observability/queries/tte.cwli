@@ -1,0 +1,50 @@
+# tte.cwli — Time-to-evict (TTE)   [Modules 03–04]
+#
+# SOURCE: native CloudWatch METRIC, not Logs Insights. TTE has no app-log
+# source — it is read from ALB target health. (File kept under queries/ with the
+# others for discoverability; run it in CloudWatch > Metrics, not Logs Insights.)
+#
+# Metric: AWS/ApplicationELB  HealthyHostCount
+#   Dimensions: LoadBalancer = app/<alb-name>/<id>
+#               TargetGroup  = targetgroup/<tg-name>/<id>
+#   Baseline healthy hosts = service desiredCount = 2.
+#
+# TTE = (first timestamp where HealthyHostCount drops below desiredCount)
+#        minus (fault start time).
+#   If it never drops within the fault window, TTE = ∞ — and that ∞ IS the
+#   health-check track's headline result: the naive /health keeps the target
+#   "healthy" straight through a DB blackhole (fail-silent). Module 04 adds a
+#   dependency-checking health path so the drop (a finite TTE) appears.
+#
+# Get the current dimension values (they change on each deploy — don't hardcode):
+#   aws elbv2 describe-load-balancers --profile cascade-resilience-atelier --region us-east-1 \
+#     --query 'LoadBalancers[?starts_with(LoadBalancerName,`Cascad`)].LoadBalancerArn'
+#   aws elbv2 describe-target-groups  --profile cascade-resilience-atelier --region us-east-1 \
+#     --query 'TargetGroups[?starts_with(TargetGroupName,`Cascad`)].TargetGroupArn'
+#   # The metric dimension is the trailing part of each ARN:
+#   #   app/<alb-name>/<id>   and   targetgroup/<tg-name>/<id>
+#
+# Pull the series at a fine period (10s) over the fault window and read the drop
+# point. Minimum (not Average) so a single unhealthy host is visible immediately:
+#
+#   aws cloudwatch get-metric-data \
+#     --profile cascade-resilience-atelier --region us-east-1 \
+#     --start-time <fault_start_iso> --end-time <fault_end_iso> \
+#     --metric-data-queries '[{
+#       "Id":"healthy",
+#       "MetricStat":{
+#         "Metric":{"Namespace":"AWS/ApplicationELB","MetricName":"HealthyHostCount",
+#           "Dimensions":[
+#             {"Name":"LoadBalancer","Value":"app/<alb-name>/<id>"},
+#             {"Name":"TargetGroup","Value":"targetgroup/<tg-name>/<id>"}]},
+#         "Period":10,"Stat":"Minimum"}}]'
+#   # TTE = first Timestamps[] entry whose Values[] < 2, minus fault_start.
+#   # All values stay 2 for the whole window  =>  TTE = ∞.
+#
+# Equivalent CloudWatch Metrics Insights query (Metrics > Query editor; set the
+# period to 10s and read the drop off the graph):
+#
+#   SELECT MIN(HealthyHostCount)
+#   FROM "AWS/ApplicationELB"
+#   WHERE TargetGroup = 'targetgroup/<tg-name>/<id>'
+#   GROUP BY TargetGroup
