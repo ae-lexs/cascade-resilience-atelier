@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func main() {
@@ -35,7 +36,15 @@ func main() {
 	}
 	defer pool.Close()
 
+	tp, err := initTracer(context.Background(), "cascade-"+os.Getenv("SERVICE_ROLE"))
+	if err != nil {
+		log.Error("tracer init failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID) // request_id for the amplification query
 	r.Use(middleware.Recoverer)
 
 	// Liveness only: the process is up. Validates NO dependency.
@@ -51,8 +60,7 @@ func main() {
 		defer cancel()
 
 		var dbTime time.Time
-		if err := pool.QueryRow(ctx, "SELECT now()").Scan(&dbTime); err != nil {
-			log.Error("db query failed", "err", err)
+		if err := dbAttempt(ctx, pool, log, "db", 1, "SELECT now()", &dbTime); err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
@@ -65,7 +73,9 @@ func main() {
 	})
 
 	log.Info("listening", "addr", ":8080", "role", os.Getenv("SERVICE_ROLE"))
-	if err := http.ListenAndServe(":8080", r); err != nil {
+
+	handler := otelhttp.NewHandler(r, "http.server")
+	if err := http.ListenAndServe(":8080", handler); err != nil {
 		log.Error("server exited", "err", err)
 		os.Exit(1)
 	}

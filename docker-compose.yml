@@ -1,6 +1,6 @@
 services:
   build:
-    image: golang:1.22-alpine
+    image: golang:1.26-alpine
     working_dir: /work/app
     volumes: [".:/work"]
 
