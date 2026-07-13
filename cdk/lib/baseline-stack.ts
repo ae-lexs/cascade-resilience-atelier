@@ -4,9 +4,14 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as rds from 'aws-cdk-lib/aws-rds';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
+import * as fs from 'fs';
 
 export class BaselineStack extends cdk.Stack {
+  public readonly dbEndpoint: string;
+
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
@@ -46,9 +51,21 @@ export class BaselineStack extends cdk.Stack {
       deleteAutomatedBackups: true,
     });
 
+    // Publish the DB host for the ApparatusStack (FIS latency `sources` param).
+    this.dbEndpoint = db.instanceEndpoint.hostname;
+
     // Single edge service.
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
-    const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', { cpu: 256, memoryLimitMiB: 512 });
+    const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', {
+      cpu: 512,                 // was 256; the ADOT sidecar needs headroom
+      memoryLimitMiB: 1024,     // was 512
+      runtimePlatform: {
+        cpuArchitecture: ecs.CpuArchitecture.X86_64,
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+      },
+      pidMode: ecs.PidMode.TASK,        // required by FIS network actions
+      enableFaultInjection: true,       // opens the ECS fault-injection endpoints
+    });
 
     const container = taskDef.addContainer('service', {
       // Pin to linux/amd64 so the image matches Fargate's default X86_64
@@ -61,12 +78,85 @@ export class BaselineStack extends cdk.Stack {
         DB_PORT: cdk.Token.asString(db.instanceEndpoint.port),
         DB_NAME: 'cascadedb',
         DB_USER: 'cascade_app',
+        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4317', // ADOT sidecar
       },
       secrets: {
         DB_PASSWORD: ecs.Secret.fromSecretsManager(db.secret!, 'password'),
       },
     });
     container.addPortMappings({ containerPort: 8080 });
+    
+    // Fail synth loudly rather than bake an empty endpoint into the task def —
+    // an empty exporter endpoint crash-loops the collector at runtime, which is
+    // near-invisible during a long deploy (CloudFormation just hangs on the ECS
+    // service). Better to stop here with a clear message.
+    const grafanaEndpoint = process.env.GRAFANA_OTLP_ENDPOINT;
+    if (!grafanaEndpoint) {
+      throw new Error(
+        'GRAFANA_OTLP_ENDPOINT must be set (the Grafana Cloud OTLP gateway URL) before deploying; ' +
+        'it is baked into the ADOT sidecar task definition.',
+      );
+    }
+
+    const grafanaAuth = secretsmanager.Secret.fromSecretNameV2(this, 'GrafanaAuth', 'cascade/grafana-otlp-auth');
+    const adot = taskDef.addContainer('adot', {
+      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/aws-observability/aws-otel-collector:latest'),
+      command: ['--config=env:AOT_CONFIG_CONTENT'],
+      // Corroborating trace path only — never take the workload down with it (§I:
+      // logs are the measurement spine, traces are a visual). A collector failure
+      // must not fail the task, or it would corrupt the numbers it only decorates.
+      essential: false,
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'adot' }),
+      environment: {
+        AOT_CONFIG_CONTENT: fs.readFileSync('../observability/collector.yaml', 'utf8'),
+        GRAFANA_OTLP_ENDPOINT: grafanaEndpoint,
+      },
+      secrets: {
+        GRAFANA_AUTH: ecs.Secret.fromSecretsManager(grafanaAuth),
+      },
+    });
+    adot.addPortMappings({ containerPort: 4317 });
+
+    // --- AWS FIS aws:ecs:task delivery: SSM Agent sidecar + managed-instance role ---
+    // FIS injects task-level faults (including the Fargate network actions) via an
+    // SSM document delivered by an SSM Agent in the task, which registers the task
+    // as an SSM Managed Instance. enableFaultInjection + pidMode:task above are
+    // necessary but NOT sufficient (contra ADR-CRA-008) — this is the delivery
+    // channel they omit. Per the FIS aws:ecs:task-actions requirements.
+    const managedInstanceRole = new iam.Role(this, 'FisSsmManagedInstanceRole', {
+      assumedBy: new iam.ServicePrincipal('ssm.amazonaws.com'),
+      description: 'Attached to ECS tasks registered as SSM managed instances for FIS',
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
+      ],
+    });
+    managedInstanceRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ssm:DeleteActivation', 'ssm:DeregisterManagedInstance'],
+      resources: ['*'],
+    }));
+
+    // Sidecar: registers the task on start, deregisters on SIGTERM. Non-essential
+    // so the chaos plumbing can never take the workload down.
+    taskDef.addContainer('ssm-agent', {
+      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/amazon-ssm-agent/amazon-ssm-agent:latest'),
+      essential: false,
+      entryPoint: ['/bin/bash', '-c'],
+      command: [fs.readFileSync('fis-ssm-activation.sh', 'utf8')],
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'ssm-agent' }),
+      environment: {
+        MANAGED_INSTANCE_ROLE_NAME: managedInstanceRole.roleName,
+      },
+    });
+
+    // Task role: create the SSM activation, tag it, and pass the managed-instance role.
+    taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['ssm:CreateActivation', 'ssm:AddTagsToResource'],
+      resources: ['*'],
+    }));
+    taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['iam:PassRole'],
+      resources: [managedInstanceRole.roleArn],
+    }));
 
     const service = new ecs.FargateService(this, 'Service', {
       cluster,
@@ -75,7 +165,10 @@ export class BaselineStack extends cdk.Stack {
       assignPublicIp: true, // pull images via IGW — no NAT (see References)
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       securityGroups: [svcSg],
+      propagateTags: ecs.PropagatedTagSource.SERVICE, // push cascade:role onto tasks for FIS targeting
     });
+
+    cdk.Tags.of(service).add('cascade:role', 'edge');
 
     // ALB + target group with the NAIVE health check.
     const alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
