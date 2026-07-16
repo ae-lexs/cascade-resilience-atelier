@@ -4,7 +4,7 @@ import { BASE, steadyStateThresholds } from './config.js';
 
 export const options = {
   scenarios: {
-    sustained: { executor: 'constant-vus', vus: 20, duration: '10m' },
+    sustained: { executor: 'constant-vus', vus: 20, duration: '35m' },
   },
   thresholds: steadyStateThresholds,
 };

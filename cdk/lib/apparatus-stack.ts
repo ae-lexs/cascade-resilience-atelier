@@ -95,7 +95,12 @@ export class ApparatusStack extends cdk.Stack {
         blackhole: {
           actionId: 'aws:ecs:task-network-blackhole-port',
           parameters: {
-            duration: 'PT5M',
+            // 30-min window per the Module 03 pre-registration (§V.4): TTE=∞ is
+            // demonstrated as "≥30 min, no eviction". The ALB eviction mechanism
+            // is bounded at interval×threshold=60s, so the finding settles in the
+            // first minutes — the long window is for pre-registration fidelity and
+            // a clean HealthyHostCount/Target_5XX corroboration line, not mechanism.
+            duration: 'PT30M',
             port: '5432',
             protocol: 'tcp',
             trafficType: 'egress',
