@@ -72,6 +72,24 @@ func main() {
 		})
 	})
 
+	// Readiness: HARD dependencies only. The DB connection pool is the single hard
+	// dependency — if we cannot get a working connection quickly, this target cannot
+	// serve /echo, so it must fail readiness and be evicted. Soft deps are NOT gated
+	// here (that is Experiment 3, Module 05). pool.Ping acquires a connection and
+	// round-trips to Postgres, so a blackholed 5432 makes this block until the
+	// 1s budget expires → 503.
+	r.Get("/ready", func(w http.ResponseWriter, req *http.Request) {
+		ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
+		defer cancel()
+		if err := pool.Ping(ctx); err != nil {
+			log.Warn("readiness probe failed", "event", "ready_fail", "err", err)
+			http.Error(w, "not ready: db", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+
 	log.Info("listening", "addr", ":8080", "role", os.Getenv("SERVICE_ROLE"))
 
 	handler := otelhttp.NewHandler(r, "http.server")
