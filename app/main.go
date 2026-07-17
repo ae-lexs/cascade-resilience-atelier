@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -29,12 +30,20 @@ func main() {
 		Path:   os.Getenv("DB_NAME"),
 	}).String()
 
+	gatesCache := os.Getenv("READY_GATES_CACHE") == "true"
+	role := os.Getenv("SERVICE_ROLE")
+
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		log.Error("cannot create a pool", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
+
+	// Cache client (soft dependency). go-redis dials lazily, so the handlers only
+	// touch it when they run; a blackholed cache fails within their ctx budgets.
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("CACHE_HOST")})
+	defer func() { _ = rdb.Close() }()
 
 	tp, err := initTracer(context.Background(), "cascade-"+os.Getenv("SERVICE_ROLE"))
 	if err != nil {
@@ -54,37 +63,48 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Load-target endpoint. One DB call, no retry — a 200 proves ALB→Fargate→RDS.
+	// /echo — cache is a SOFT dependency (cache-aside). A cache miss OR a cache
+	// OUTAGE falls through to the DB; the request still returns 200. "Soft" = the
+	// request degrades (cache bypassed, one extra DB hit), it does not fail.
 	r.Get("/echo", func(w http.ResponseWriter, req *http.Request) {
 		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
 		defer cancel()
+
+		// Best-effort cache read with a SHORT budget so an outage can't slow /echo much.
+		cctx, ccancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		if v, err := rdb.Get(cctx, "now").Result(); err == nil {
+			ccancel()
+			writeJSON(w, map[string]any{"service": role, "db_time": v, "cache": "hit"})
+			return
+		}
+		ccancel() // miss or cache down — fall through, do NOT fail
 
 		var dbTime time.Time
 		if err := dbAttempt(ctx, pool, log, "db", 1, "SELECT now()", &dbTime); err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"service": os.Getenv("SERVICE_ROLE"),
-			"db_time": dbTime.Format(time.RFC3339Nano),
-		})
+		_ = rdb.Set(context.Background(), "now", dbTime.Format(time.RFC3339Nano), 5*time.Second).Err() // best-effort repopulate
+		writeJSON(w, map[string]any{"service": role, "db_time": dbTime, "cache": "miss"})
 	})
 
-	// Readiness: HARD dependencies only. The DB connection pool is the single hard
-	// dependency — if we cannot get a working connection quickly, this target cannot
-	// serve /echo, so it must fail readiness and be evicted. Soft deps are NOT gated
-	// here (that is Experiment 3, Module 05). pool.Ping acquires a connection and
-	// round-trips to Postgres, so a blackholed 5432 makes this block until the
-	// 1s budget expires → 503.
+	// /ready — HARD deps only, UNLESS the trap is armed. The DB pool check is always
+	// present (Module 04). READY_GATES_CACHE=true adds the soft cache dep as if hard.
 	r.Get("/ready", func(w http.ResponseWriter, req *http.Request) {
 		ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
 		defer cancel()
-		if err := pool.Ping(ctx); err != nil {
-			log.Warn("readiness probe failed", "event", "ready_fail", "err", err)
+		if err := pool.Ping(ctx); err != nil { // hard dep — correct
 			http.Error(w, "not ready: db", http.StatusServiceUnavailable)
 			return
+		}
+		if gatesCache { // THE MIS-DESIGN — soft dep gated as hard
+			cctx, ccancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer ccancel()
+			if err := rdb.Ping(cctx).Err(); err != nil {
+				log.Warn("readiness failing on SOFT dep", "event", "ready_fail_cache", "err", err)
+				http.Error(w, "not ready: cache", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
@@ -97,4 +117,9 @@ func main() {
 		log.Error("server exited", "err", err)
 		os.Exit(1)
 	}
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }

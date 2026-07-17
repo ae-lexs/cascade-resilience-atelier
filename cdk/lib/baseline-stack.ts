@@ -4,6 +4,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as rds from 'aws-cdk-lib/aws-rds';
+import * as elasticache from 'aws-cdk-lib/aws-elasticache';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
@@ -54,6 +55,25 @@ export class BaselineStack extends cdk.Stack {
     // Publish the DB host for the ApparatusStack (FIS latency `sources` param).
     this.dbEndpoint = db.instanceEndpoint.hostname;
 
+    // Module 05: a single-node Redis as a genuine SOFT dependency (cache-aside in
+    // /echo). Lives in the isolated subnets alongside RDS, reachable only from the
+    // service SG. The Module 05 fault is a subnet-NACL deny on 6379 (port-scoped,
+    // so RDS on 5432 in the same subnets is unaffected).
+    const cacheSg = new ec2.SecurityGroup(this, 'CacheSg', { vpc, description: 'Redis from service only' });
+    cacheSg.addIngressRule(svcSg, ec2.Port.tcp(6379), 'service to Redis');
+
+    const cacheSubnets = new elasticache.CfnSubnetGroup(this, 'CacheSubnets', {
+      description: 'cache subnets',
+      subnetIds: vpc.selectSubnets({ subnetType: ec2.SubnetType.PRIVATE_ISOLATED }).subnetIds,
+    });
+    const cache = new elasticache.CfnCacheCluster(this, 'Cache', {
+      engine: 'redis',
+      cacheNodeType: 'cache.t4g.micro',
+      numCacheNodes: 1,
+      vpcSecurityGroupIds: [cacheSg.securityGroupId],
+      cacheSubnetGroupName: cacheSubnets.ref,
+    });
+
     // Single edge service.
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
     const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', {
@@ -78,6 +98,11 @@ export class BaselineStack extends cdk.Stack {
         DB_PORT: cdk.Token.asString(db.instanceEndpoint.port),
         DB_NAME: 'cascadedb',
         DB_USER: 'cascade_app',
+        CACHE_HOST: `${cache.attrRedisEndpointAddress}:${cache.attrRedisEndpointPort}`,
+        // Module 05 two-arm toggle: `false` = control (DB-only /ready),
+        // `true` = treatment (gates the soft cache dep). Flip via CDK context:
+        //   cdk deploy CascadeBaseline -c readyGatesCache=true
+        READY_GATES_CACHE: this.node.tryGetContext('readyGatesCache') === 'true' ? 'true' : 'false',
         OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4317', // ADOT sidecar
       },
       secrets: {
