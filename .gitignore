@@ -14,3 +14,5 @@ node_modules/
 /out/
 # compiled binary from `go build`
 /app/app
+
+cdk.context.json

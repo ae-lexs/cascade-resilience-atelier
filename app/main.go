@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,26 +14,39 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
+const (
+	maxAttempts       = 3               // ONE layer, three attempts
+	perAttemptTimeout = 2 * time.Second // < 3000ms injected latency → each attempt times out under fault
+	baseBackoff       = 100 * time.Millisecond
+)
+
+// server holds the dependencies shared by the HTTP handlers.
+type server struct {
+	pool       *pgxpool.Pool
+	rdb        *redis.Client
+	log        *slog.Logger
+	role       string
+	gatesCache bool
+}
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	// Password is injected as a secret; everything else is plain env.
-	// Build the DSN via net/url so the generated password (which can contain
-	// URL-reserved chars like ^ = ,) is percent-encoded correctly.
+	// Password is injected as a secret; everything else is plain env. Build the DSN
+	// via net/url so the generated password (which can contain URL-reserved chars
+	// like ^ = ,) is percent-encoded correctly.
 	dsn := (&url.URL{
 		Scheme: "postgres",
 		User:   url.UserPassword(os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD")),
 		Host:   net.JoinHostPort(os.Getenv("DB_HOST"), os.Getenv("DB_PORT")),
 		Path:   os.Getenv("DB_NAME"),
 	}).String()
-
-	gatesCache := os.Getenv("READY_GATES_CACHE") == "true"
-	role := os.Getenv("SERVICE_ROLE")
 
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
@@ -45,78 +60,127 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("CACHE_HOST")})
 	defer func() { _ = rdb.Close() }()
 
-	tp, err := initTracer(context.Background(), "cascade-"+os.Getenv("SERVICE_ROLE"))
+	role := os.Getenv("SERVICE_ROLE")
+	tp, err := initTracer(context.Background(), "cascade-"+role)
 	if err != nil {
 		log.Error("tracer init failed", "err", err)
 		os.Exit(1)
 	}
 	defer func() { _ = tp.Shutdown(context.Background()) }()
 
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID) // request_id for the amplification query
-	r.Use(middleware.Recoverer)
+	srv := &server{
+		pool:       pool,
+		rdb:        rdb,
+		log:        log,
+		role:       role,
+		gatesCache: os.Getenv("READY_GATES_CACHE") == "true",
+	}
 
-	// Liveness only: the process is up. Validates NO dependency.
-	// This naive 200 is the anti-baseline the health-check track attacks.
-	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	// /echo — cache is a SOFT dependency (cache-aside). A cache miss OR a cache
-	// OUTAGE falls through to the DB; the request still returns 200. "Soft" = the
-	// request degrades (cache bypassed, one extra DB hit), it does not fail.
-	r.Get("/echo", func(w http.ResponseWriter, req *http.Request) {
-		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
-		defer cancel()
-
-		// Best-effort cache read with a SHORT budget so an outage can't slow /echo much.
-		cctx, ccancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		if v, err := rdb.Get(cctx, "now").Result(); err == nil {
-			ccancel()
-			writeJSON(w, map[string]any{"service": role, "db_time": v, "cache": "hit"})
-			return
-		}
-		ccancel() // miss or cache down — fall through, do NOT fail
-
-		var dbTime time.Time
-		if err := dbAttempt(ctx, pool, log, "db", 1, "SELECT now()", &dbTime); err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		_ = rdb.Set(context.Background(), "now", dbTime.Format(time.RFC3339Nano), 5*time.Second).Err() // best-effort repopulate
-		writeJSON(w, map[string]any{"service": role, "db_time": dbTime, "cache": "miss"})
-	})
-
-	// /ready — HARD deps only, UNLESS the trap is armed. The DB pool check is always
-	// present (Module 04). READY_GATES_CACHE=true adds the soft cache dep as if hard.
-	r.Get("/ready", func(w http.ResponseWriter, req *http.Request) {
-		ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
-		defer cancel()
-		if err := pool.Ping(ctx); err != nil { // hard dep — correct
-			http.Error(w, "not ready: db", http.StatusServiceUnavailable)
-			return
-		}
-		if gatesCache { // THE MIS-DESIGN — soft dep gated as hard
-			cctx, ccancel := context.WithTimeout(ctx, 500*time.Millisecond)
-			defer ccancel()
-			if err := rdb.Ping(cctx).Err(); err != nil {
-				log.Warn("readiness failing on SOFT dep", "event", "ready_fail_cache", "err", err)
-				http.Error(w, "not ready: cache", http.StatusServiceUnavailable)
-				return
-			}
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready"))
-	})
-
-	log.Info("listening", "addr", ":8080", "role", os.Getenv("SERVICE_ROLE"))
-
-	handler := otelhttp.NewHandler(r, "http.server")
+	log.Info("listening", "addr", ":8080", "role", role)
+	handler := otelhttp.NewHandler(srv.routes(), "http.server")
 	if err := http.ListenAndServe(":8080", handler); err != nil {
 		log.Error("server exited", "err", err)
 		os.Exit(1)
 	}
+}
+
+func (s *server) routes() http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID) // request_id for the amplification query
+	r.Use(middleware.Recoverer)
+	r.Get("/health", s.handleHealth)
+	r.Get("/echo", s.handleEcho)
+	r.Get("/ready", s.handleReady)
+	return r
+}
+
+// handleHealth is liveness only: the process is up, validating NO dependency.
+// This naive 200 is the anti-baseline the health-check track attacks.
+func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleEcho drives the DB on EVERY request through the single-layer retry.
+// The Module 05 cache-aside is intentionally BYPASSED for the retry track: the
+// cache is unused here (Module 06 §I), and a cache hit would skip the DB and
+// mask the amplification. Cache-free /echo makes every request exercise all
+// retry attempts under the latency fault, so the db_attempt line-count per
+// request IS the amplification (ADR-CRA-008).
+func (s *server) handleEcho(w http.ResponseWriter, req *http.Request) {
+	// Budget generous enough for 3 attempts + jittered backoff (worst case ~6.5s).
+	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+	defer cancel()
+	dbTime, err := s.queryNow(ctx)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"service": s.role, "db_time": dbTime})
+}
+
+// queryNow runs the single-layer retry: up to maxAttempts DB attempts, each on
+// its own perAttemptTimeout budget, with exponential backoff between. Each
+// attempt emits a db_attempt line, so under the DB-latency fault (3s >
+// perAttemptTimeout) every attempt times out and the retries ARE the
+// amplification the retry track measures.
+func (s *server) queryNow(ctx context.Context) (time.Time, error) {
+	var dbTime time.Time
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
+		err = dbAttempt(actx, s.pool, s.log, "db", attempt, "SELECT now()", &dbTime)
+		cancel()
+		if err == nil {
+			return dbTime, nil
+		}
+		if !isRetryable(err) { // THE GATE (Cluster 1 §VIII) — never retry client-error classes
+			return dbTime, err
+		}
+		if attempt < maxAttempts {
+			// Exponential backoff with FULL jitter (Brooker): sleep ∈ [0, base·2^(n-1)].
+			time.Sleep(jitter(baseBackoff << (attempt - 1)))
+		}
+	}
+	return dbTime, err
+}
+
+// isRetryable gates retries to transient failures: the per-attempt context
+// deadline (our timeout under the latency fault) and pgconn-safe errors are
+// retryable; client-error classes are not.
+func isRetryable(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || pgconn.SafeToRetry(err)
+}
+
+// jitter returns a random duration in [0, d) — full jitter.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(d)))
+}
+
+// handleReady gates HARD dependencies only, UNLESS the trap is armed. The DB
+// pool check is always present (Module 04); READY_GATES_CACHE=true adds the soft
+// cache dep as if it were hard (the Module 05 mis-design).
+func (s *server) handleReady(w http.ResponseWriter, req *http.Request) {
+	ctx, cancel := context.WithTimeout(req.Context(), 1*time.Second)
+	defer cancel()
+	if err := s.pool.Ping(ctx); err != nil { // hard dep — correct
+		http.Error(w, "not ready: db", http.StatusServiceUnavailable)
+		return
+	}
+	if s.gatesCache { // THE MIS-DESIGN — soft dep gated as hard
+		cctx, ccancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer ccancel()
+		if err := s.rdb.Ping(cctx).Err(); err != nil {
+			s.log.Warn("readiness failing on SOFT dep", "event", "ready_fail_cache", "err", err)
+			http.Error(w, "not ready: cache", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

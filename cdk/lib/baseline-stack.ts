@@ -208,11 +208,14 @@ export class BaselineStack extends cdk.Stack {
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [service],
       healthCheck: {
-        path: '/ready',                          // Experiment 2: hard-dependency-aware readiness
+        // Retry track (Module 06+): revert to naive /health (no DB) so the
+        // DB-latency fault can't fail the health check and evict the faulted
+        // tasks — they must stay in rotation to produce a stable amplification.
+        // (The /ready 5s×6 config belongs to the health-check track, Modules 03–05.)
+        path: '/health',
         healthyThresholdCount: 2,
-        unhealthyThresholdCount: 6,              // 6 consecutive failures...
-        interval: cdk.Duration.seconds(5),       // ...at 5s each → TTE ≈ 30s
-        timeout: cdk.Duration.seconds(2),        // MUST be < interval; > the 1s readiness budget
+        unhealthyThresholdCount: 2,
+        interval: cdk.Duration.seconds(30),
       },
     });
 
