@@ -15,5 +15,6 @@ const baseline = new BaselineStack(app, 'CascadeBaseline', { env });
 new ApparatusStack(app, 'CascadeApparatus', {
     env,
     dbEndpoint: baseline.dbEndpoint,
-    taskRoleTag: 'edge',
+    taskRoleTag: 'edge',            // blackhole (health-check track) targets the edge
+    dbLatencyRoleTag: 'downstream', // latency (cascade track) targets the DB-calling downstream (Module 07)
 });

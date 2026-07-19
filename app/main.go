@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -21,9 +22,15 @@ import (
 )
 
 const (
-	maxAttempts       = 3               // ONE layer, three attempts
+	maxAttempts       = 3               // Layer 1: ONE DB-retry layer, three attempts
 	perAttemptTimeout = 2 * time.Second // < 3000ms injected latency → each attempt times out under fault
 	baseBackoff       = 100 * time.Millisecond
+
+	// Layer 2 (Module 07, edge role): the edge retries the whole downstream call.
+	downstreamMaxAttempts = 3               // three edge→downstream attempts
+	downstreamTimeout     = 8 * time.Second // MUST exceed one full Layer-1 cascade (~6.3s) so the
+	//                                         downstream completes all 3 DB attempts before Layer 2
+	//                                         gives up. Shorter here truncates the cascade (§V.4).
 )
 
 // server holds the dependencies shared by the HTTP handlers.
@@ -33,6 +40,12 @@ type server struct {
 	log        *slog.Logger
 	role       string
 	gatesCache bool
+
+	// Multi-layer cascade (Module 07): when downstreamURL is set, the edge plays
+	// the proxy role and runs Layer 2 (echoViaDownstream) instead of the Layer-1
+	// DB path. Empty → Module 06 single-layer behaviour (queryNow directly).
+	downstreamURL string
+	httpClient    *http.Client
 }
 
 func main() {
@@ -74,6 +87,11 @@ func main() {
 		log:        log,
 		role:       role,
 		gatesCache: os.Getenv("READY_GATES_CACHE") == "true",
+		// DOWNSTREAM_URL is set only on the edge in the multi-layer topology
+		// (Module 07). The otelhttp transport propagates the W3C traceparent so
+		// one trace spans all three layers.
+		downstreamURL: os.Getenv("DOWNSTREAM_URL"),
+		httpClient:    &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)},
 	}
 
 	log.Info("listening", "addr", ":8080", "role", role)
@@ -101,14 +119,20 @@ func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-// handleEcho drives the DB on EVERY request through the single-layer retry.
-// The Module 05 cache-aside is intentionally BYPASSED for the retry track: the
-// cache is unused here (Module 06 §I), and a cache hit would skip the DB and
-// mask the amplification. Cache-free /echo makes every request exercise all
-// retry attempts under the latency fault, so the db_attempt line-count per
-// request IS the amplification (ADR-CRA-008).
+// handleEcho dispatches by topology. If a downstream is wired (edge role in the
+// multi-layer cascade, Module 07), proxy to it with the Layer-2 retry; otherwise
+// run the Module 06 single-layer DB path directly (queryNow). ONE binary serves
+// both experiments, and the layer count stays honest — the edge never runs BOTH
+// the proxy retry and a DB retry (that would be a 4th layer, the >40× falsifier).
+//
+// The Module 05 cache-aside stays bypassed for the retry track (cache unused
+// here, Module 06 §I): a cache hit would skip the DB and mask the amplification.
 func (s *server) handleEcho(w http.ResponseWriter, req *http.Request) {
-	// Budget generous enough for 3 attempts + jittered backoff (worst case ~6.5s).
+	if s.downstreamURL != "" {
+		s.echoViaDownstream(w, req) // Layer 2 (Module 07, edge role)
+		return
+	}
+	// Layer 1 only (Module 06 path): budget generous for 3 DB attempts + backoff.
 	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
 	defer cancel()
 	dbTime, err := s.queryNow(ctx)
@@ -117,6 +141,58 @@ func (s *server) handleEcho(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"service": s.role, "db_time": dbTime})
+}
+
+// echoViaDownstream is Layer 2: the edge retries the whole downstream call up to
+// 3 times. Each attempt is one HTTP call to downstream /echo, which itself runs
+// Layer 1 (up to 3 DB attempts). So one edge request drives up to 3 × 3 = 9
+// db_attempt lines; the k6 client retry (Layer 3) triples that to 27.
+func (s *server) echoViaDownstream(w http.ResponseWriter, req *http.Request) {
+	ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second) // ≥ 3 Layer-2 attempts + backoff
+	defer cancel()
+
+	var lastErr error
+	for attempt := 1; attempt <= downstreamMaxAttempts; attempt++ {
+		actx, acancel := context.WithTimeout(ctx, downstreamTimeout)
+		status, body, err := s.callDownstream(actx, req)
+		acancel()
+		if err == nil && status == http.StatusOK {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+			return
+		}
+		if status >= 400 && status < 500 { // THE GATE (Cluster 1 §VIII) — client errors will fail again
+			http.Error(w, "downstream client error", status)
+			return
+		}
+		lastErr = err
+		if attempt < downstreamMaxAttempts {
+			time.Sleep(jitter(baseBackoff << (attempt - 1))) // full jitter, reused from Module 06
+		}
+	}
+	s.log.Warn("layer-2 exhausted", "event", "downstream_exhausted",
+		"request_id", middleware.GetReqID(req.Context()), "err", lastErr)
+	http.Error(w, "downstream error", http.StatusInternalServerError)
+}
+
+// callDownstream issues ONE Layer-2 attempt against downstream /echo. It forwards
+// X-Request-Id so chi's RequestID middleware on the downstream REUSES the origin
+// id instead of minting a fresh one — that reuse is what makes the amplification
+// query count attempts per ORIGINATING request (§VI.2). The otelhttp transport
+// propagates the traceparent so all layers share one trace.
+func (s *server) callDownstream(ctx context.Context, orig *http.Request) (int, []byte, error) {
+	r, err := http.NewRequestWithContext(ctx, http.MethodGet, s.downstreamURL+"/echo", nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	r.Header.Set("X-Request-Id", middleware.GetReqID(orig.Context())) // origin-id propagation
+	resp, err := s.httpClient.Do(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, nil
 }
 
 // queryNow runs the single-layer retry: up to maxAttempts DB attempts, each on

@@ -74,47 +74,18 @@ export class BaselineStack extends cdk.Stack {
       cacheSubnetGroupName: cacheSubnets.ref,
     });
 
-    // Single edge service.
+    // Shared ECS cluster with a private DNS namespace so the edge can discover the
+    // downstream service by name (edge → downstream.cascade.local, Module 07).
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
-    const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', {
-      cpu: 512,                 // was 256; the ADOT sidecar needs headroom
-      memoryLimitMiB: 1024,     // was 512
-      runtimePlatform: {
-        cpuArchitecture: ecs.CpuArchitecture.X86_64,
-        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
-      },
-      pidMode: ecs.PidMode.TASK,        // required by FIS network actions
-      enableFaultInjection: true,       // opens the ECS fault-injection endpoints
-    });
+    cluster.addDefaultCloudMapNamespace({ name: 'cascade.local' }); // DNS_PRIVATE (default)
 
-    const container = taskDef.addContainer('service', {
-      // Pin to linux/amd64 so the image matches Fargate's default X86_64
-      // platform regardless of build host (e.g. Apple Silicon arm64).
-      image: ecs.ContainerImage.fromAsset('..', { file: 'Dockerfile', platform: Platform.LINUX_AMD64 }),
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'cascade' }),
-      environment: {
-        SERVICE_ROLE: 'edge',
-        DB_HOST: db.instanceEndpoint.hostname,
-        DB_PORT: cdk.Token.asString(db.instanceEndpoint.port),
-        DB_NAME: 'cascadedb',
-        DB_USER: 'cascade_app',
-        CACHE_HOST: `${cache.attrRedisEndpointAddress}:${cache.attrRedisEndpointPort}`,
-        // Module 05 two-arm toggle: `false` = control (DB-only /ready),
-        // `true` = treatment (gates the soft cache dep). Flip via CDK context:
-        //   cdk deploy CascadeBaseline -c readyGatesCache=true
-        READY_GATES_CACHE: this.node.tryGetContext('readyGatesCache') === 'true' ? 'true' : 'false',
-        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4317', // ADOT sidecar
-      },
-      secrets: {
-        DB_PASSWORD: ecs.Secret.fromSecretsManager(db.secret!, 'password'),
-      },
-    });
-    container.addPortMappings({ containerPort: 8080 });
-    
-    // Fail synth loudly rather than bake an empty endpoint into the task def —
-    // an empty exporter endpoint crash-loops the collector at runtime, which is
-    // near-invisible during a long deploy (CloudFormation just hangs on the ECS
-    // service). Better to stop here with a clear message.
+    // Edge → downstream on 8080 (Layer 2 of the multi-layer cascade). Both
+    // services share svcSg, so this is a self-ingress rule.
+    svcSg.addIngressRule(svcSg, ec2.Port.tcp(8080), 'edge to downstream');
+
+    // Fail synth loudly rather than bake an empty endpoint into the task def — an
+    // empty exporter endpoint crash-loops the collector at runtime, near-invisible
+    // during a long deploy (CloudFormation just hangs on the ECS service).
     const grafanaEndpoint = process.env.GRAFANA_OTLP_ENDPOINT;
     if (!grafanaEndpoint) {
       throw new Error(
@@ -122,32 +93,14 @@ export class BaselineStack extends cdk.Stack {
         'it is baked into the ADOT sidecar task definition.',
       );
     }
-
     const grafanaAuth = secretsmanager.Secret.fromSecretNameV2(this, 'GrafanaAuth', 'cascade/grafana-otlp-auth');
-    const adot = taskDef.addContainer('adot', {
-      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/aws-observability/aws-otel-collector:latest'),
-      command: ['--config=env:AOT_CONFIG_CONTENT'],
-      // Corroborating trace path only — never take the workload down with it (§I:
-      // logs are the measurement spine, traces are a visual). A collector failure
-      // must not fail the task, or it would corrupt the numbers it only decorates.
-      essential: false,
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'adot' }),
-      environment: {
-        AOT_CONFIG_CONTENT: fs.readFileSync('../observability/collector.yaml', 'utf8'),
-        GRAFANA_OTLP_ENDPOINT: grafanaEndpoint,
-      },
-      secrets: {
-        GRAFANA_AUTH: ecs.Secret.fromSecretsManager(grafanaAuth),
-      },
-    });
-    adot.addPortMappings({ containerPort: 4317 });
 
     // --- AWS FIS aws:ecs:task delivery: SSM Agent sidecar + managed-instance role ---
-    // FIS injects task-level faults (including the Fargate network actions) via an
-    // SSM document delivered by an SSM Agent in the task, which registers the task
-    // as an SSM Managed Instance. enableFaultInjection + pidMode:task above are
-    // necessary but NOT sufficient (contra ADR-CRA-008) — this is the delivery
-    // channel they omit. Per the FIS aws:ecs:task-actions requirements.
+    // FIS injects task-level faults via an SSM document delivered by an SSM Agent
+    // in the task, which registers the task as an SSM Managed Instance.
+    // enableFaultInjection + pidMode:task are necessary but NOT sufficient (contra
+    // ADR-CRA-008) — this is the delivery channel they omit. Shared across roles so
+    // either service can be the FIS target (Module 07 targets the downstream).
     const managedInstanceRole = new iam.Role(this, 'FisSsmManagedInstanceRole', {
       assumedBy: new iam.ServicePrincipal('ssm.amazonaws.com'),
       description: 'Attached to ECS tasks registered as SSM managed instances for FIS',
@@ -160,42 +113,123 @@ export class BaselineStack extends cdk.Stack {
       resources: ['*'],
     }));
 
-    // Sidecar: registers the task on start, deregisters on SIGTERM. Non-essential
-    // so the chaos plumbing can never take the workload down.
-    taskDef.addContainer('ssm-agent', {
-      image: ecs.ContainerImage.fromRegistry('public.ecr.aws/amazon-ssm-agent/amazon-ssm-agent:latest'),
-      essential: false,
-      entryPoint: ['/bin/bash', '-c'],
-      command: [fs.readFileSync('fis-ssm-activation.sh', 'utf8')],
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'ssm-agent' }),
-      environment: {
-        MANAGED_INSTANCE_ROLE_NAME: managedInstanceRole.roleName,
-      },
+    const ssmActivation = fs.readFileSync('fis-ssm-activation.sh', 'utf8');
+    const collectorConfig = fs.readFileSync('../observability/collector.yaml', 'utf8');
+    const readyGatesCache = this.node.tryGetContext('readyGatesCache') === 'true' ? 'true' : 'false';
+
+    // One Fargate service per role, identical sidecar set (service + ADOT +
+    // SSM agent). The SAME image serves both — the Go binary switches behaviour on
+    // SERVICE_ROLE / DOWNSTREAM_URL. Env is parameterised per role.
+    const makeService = (
+      idPrefix: string,
+      role: string,
+      streamPrefix: string,
+      extraEnv: Record<string, string>,
+      cloudMapName?: string,
+    ): ecs.FargateService => {
+      const taskDef = new ecs.FargateTaskDefinition(this, `${idPrefix}TaskDef`, {
+        cpu: 512,             // the ADOT sidecar needs headroom
+        memoryLimitMiB: 1024,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.X86_64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
+        pidMode: ecs.PidMode.TASK,   // required by FIS network actions
+        enableFaultInjection: true,  // opens the ECS fault-injection endpoints
+      });
+
+      const container = taskDef.addContainer('service', {
+        // Pin to linux/amd64 so the image matches Fargate's default X86_64
+        // platform regardless of build host (e.g. Apple Silicon arm64).
+        image: ecs.ContainerImage.fromAsset('..', { file: 'Dockerfile', platform: Platform.LINUX_AMD64 }),
+        logging: ecs.LogDrivers.awsLogs({ streamPrefix }),
+        environment: {
+          SERVICE_ROLE: role,
+          DB_HOST: db.instanceEndpoint.hostname,
+          DB_PORT: cdk.Token.asString(db.instanceEndpoint.port),
+          DB_NAME: 'cascadedb',
+          DB_USER: 'cascade_app',
+          CACHE_HOST: `${cache.attrRedisEndpointAddress}:${cache.attrRedisEndpointPort}`,
+          READY_GATES_CACHE: readyGatesCache,
+          OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4317', // ADOT sidecar
+          ...extraEnv,
+        },
+        secrets: {
+          DB_PASSWORD: ecs.Secret.fromSecretsManager(db.secret!, 'password'),
+        },
+      });
+      container.addPortMappings({ containerPort: 8080 });
+
+      // Corroborating trace path only — never take the workload down with it (§I:
+      // logs are the measurement spine, traces a visual). Non-essential so a
+      // collector failure can't corrupt the numbers it only decorates.
+      const adot = taskDef.addContainer('adot', {
+        image: ecs.ContainerImage.fromRegistry('public.ecr.aws/aws-observability/aws-otel-collector:latest'),
+        command: ['--config=env:AOT_CONFIG_CONTENT'],
+        essential: false,
+        logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'adot' }),
+        environment: {
+          AOT_CONFIG_CONTENT: collectorConfig,
+          GRAFANA_OTLP_ENDPOINT: grafanaEndpoint,
+        },
+        secrets: {
+          GRAFANA_AUTH: ecs.Secret.fromSecretsManager(grafanaAuth),
+        },
+      });
+      adot.addPortMappings({ containerPort: 4317 });
+
+      // SSM agent sidecar: registers the task on start, deregisters on SIGTERM.
+      // Non-essential so the chaos plumbing can never take the workload down.
+      taskDef.addContainer('ssm-agent', {
+        image: ecs.ContainerImage.fromRegistry('public.ecr.aws/amazon-ssm-agent/amazon-ssm-agent:latest'),
+        essential: false,
+        entryPoint: ['/bin/bash', '-c'],
+        command: [ssmActivation],
+        logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'ssm-agent' }),
+        environment: {
+          MANAGED_INSTANCE_ROLE_NAME: managedInstanceRole.roleName,
+        },
+      });
+
+      // Task role: create the SSM activation, tag it, and pass the managed-instance role.
+      taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['ssm:CreateActivation', 'ssm:AddTagsToResource'],
+        resources: ['*'],
+      }));
+      taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['iam:PassRole'],
+        resources: [managedInstanceRole.roleArn],
+      }));
+
+      const svc = new ecs.FargateService(this, `${idPrefix}Service`, {
+        cluster,
+        taskDefinition: taskDef,
+        desiredCount: 2,
+        assignPublicIp: true, // pull images via IGW — no NAT (see References)
+        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+        securityGroups: [svcSg],
+        propagateTags: ecs.PropagatedTagSource.SERVICE, // push cascade:role onto tasks for FIS targeting
+        // Fail a bad deploy in minutes instead of hanging ~3h if tasks can't
+        // start; rollback:false leaves the failed state for inspection.
+        circuitBreaker: { rollback: false },
+        ...(cloudMapName ? { cloudMapOptions: { name: cloudMapName } } : {}),
+      });
+      cdk.Tags.of(svc).add('cascade:role', role);
+      return svc;
+    };
+
+    // Downstream owns the DB call (Layer 1, identical to Module 06's queryNow) and
+    // is the FIS latency target. All db_attempt lines originate here → the
+    // amplification query runs over the 'cascade-downstream' log group.
+    makeService('Downstream', 'downstream', 'cascade-downstream', {}, 'downstream');
+
+    // Edge proxies to the downstream with the Layer-2 retry (echoViaDownstream);
+    // DOWNSTREAM_URL wired → the edge never runs the DB path directly.
+    const edge = makeService('Edge', 'edge', 'cascade', {
+      DOWNSTREAM_URL: 'http://downstream.cascade.local:8080',
     });
 
-    // Task role: create the SSM activation, tag it, and pass the managed-instance role.
-    taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
-      actions: ['ssm:CreateActivation', 'ssm:AddTagsToResource'],
-      resources: ['*'],
-    }));
-    taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
-      actions: ['iam:PassRole'],
-      resources: [managedInstanceRole.roleArn],
-    }));
-
-    const service = new ecs.FargateService(this, 'Service', {
-      cluster,
-      taskDefinition: taskDef,
-      desiredCount: 2,
-      assignPublicIp: true, // pull images via IGW — no NAT (see References)
-      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-      securityGroups: [svcSg],
-      propagateTags: ecs.PropagatedTagSource.SERVICE, // push cascade:role onto tasks for FIS targeting
-    });
-
-    cdk.Tags.of(service).add('cascade:role', 'edge');
-
-    // ALB + target group with the NAIVE health check.
+    // ALB fronts the EDGE only (the downstream is reached via service discovery).
     const alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
       vpc,
       internetFacing: true,
@@ -206,12 +240,10 @@ export class BaselineStack extends cdk.Stack {
     alb.addListener('Http', { port: 80, open: false }).addTargets('Service', {
       port: 8080,
       protocol: elbv2.ApplicationProtocol.HTTP,
-      targets: [service],
+      targets: [edge],
       healthCheck: {
-        // Retry track (Module 06+): revert to naive /health (no DB) so the
-        // DB-latency fault can't fail the health check and evict the faulted
-        // tasks — they must stay in rotation to produce a stable amplification.
-        // (The /ready 5s×6 config belongs to the health-check track, Modules 03–05.)
+        // Naive /health (no DB) so the DB-latency fault can't fail the health
+        // check and evict the faulted downstream tasks mid-run (retry track).
         path: '/health',
         healthyThresholdCount: 2,
         unhealthyThresholdCount: 2,

@@ -4,8 +4,10 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as fis from 'aws-cdk-lib/aws-fis';
 
 interface ApparatusStackProps extends cdk.StackProps {
-  dbEndpoint: string;      // for the FIS latency `sources` param
-  taskRoleTag: string;     // 'edge' — the FIS target tag value
+  dbEndpoint: string;         // for the FIS latency `sources` param
+  taskRoleTag: string;        // 'edge' — blackhole target (health-check track)
+  dbLatencyRoleTag: string;   // the DB-CALLING service the latency fault targets:
+  //                            'edge' single-service (Mod 06), 'downstream' multi-layer (Mod 07)
 }
 
 export class ApparatusStack extends cdk.Stack {
@@ -38,7 +40,7 @@ export class ApparatusStack extends cdk.Stack {
     // accepts a domain name, so the RDS endpoint hostname is valid (and preferred
     // over an IP, which RDS can rotate).
     const dbLatency = new fis.CfnExperimentTemplate(this, 'DbLatency', {
-      description: 'DB-path latency into edge tasks (cascade track)',
+      description: `DB-path latency into ${props.dbLatencyRoleTag} tasks (cascade track)`,
       roleArn: fisRole.roleArn,
       stopConditions: [{ source: 'none' }],
       tags: { Name: 'cascade-db-latency' },
@@ -46,7 +48,7 @@ export class ApparatusStack extends cdk.Stack {
         edgeTasks: {
           resourceType: 'aws:ecs:task',
           selectionMode: 'ALL',
-          resourceTags: { 'cascade:role': props.taskRoleTag },
+          resourceTags: { 'cascade:role': props.dbLatencyRoleTag },
           // propagateTags:SERVICE stamps cascade:role=edge on EVERY task the
           // service launches, including STOPPED ones from prior deploys, which
           // FIS's tag resolution returns. Those have no SSM managed instance, so
@@ -60,7 +62,10 @@ export class ApparatusStack extends cdk.Stack {
         latency: {
           actionId: 'aws:ecs:task-network-latency',
           parameters: {
-            duration: 'PT5M',
+            // PT10M (Module 07): one originating request takes ~60s under the
+            // three-layer cascade, so the window must be long enough to accrue a
+            // stable set of clean-window originating requests (§V.4).
+            duration: 'PT10M',
             delayMilliseconds: '3000',              // > 2s DB timeout
             sources: props.dbEndpoint,              // scope to RDS only
             useEcsFaultInjectionEndpoints: 'true',
