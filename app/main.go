@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -18,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/sony/gobreaker"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -46,7 +48,18 @@ type server struct {
 	// DB path. Empty → Module 06 single-layer behaviour (queryNow directly).
 	downstreamURL string
 	httpClient    *http.Client
+
+	// Cascade mitigation (Module 08): non-nil only when EDGE_BREAKER=true. When
+	// set, the edge drops the Layer-2 retry loop and instead guards a SINGLE
+	// edge→downstream call behind this circuit breaker (echoViaDownstreamBreaker).
+	// nil → Module 07 behaviour (echoViaDownstream retry loop).
+	breaker *gobreaker.CircuitBreaker
 }
+
+// errClientError marks a downstream 4xx: it is surfaced to the caller but must
+// NOT count as a breaker failure — the same error gate as the retry loop
+// (Cluster 1 §VIII), a client error is not the dependency's fault.
+var errClientError = errors.New("downstream client error (4xx)")
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -94,6 +107,12 @@ func main() {
 		httpClient:    &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)},
 	}
 
+	// Module 08 mitigation: arm the edge→downstream circuit breaker when flagged.
+	if os.Getenv("EDGE_BREAKER") == "true" {
+		srv.breaker = newBreaker(log)
+		log.Info("edge breaker armed (Module 08 mitigation)")
+	}
+
 	log.Info("listening", "addr", ":8080", "role", role)
 	handler := otelhttp.NewHandler(srv.routes(), "http.server")
 	if err := http.ListenAndServe(":8080", handler); err != nil {
@@ -129,7 +148,11 @@ func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // here, Module 06 §I): a cache hit would skip the DB and mask the amplification.
 func (s *server) handleEcho(w http.ResponseWriter, req *http.Request) {
 	if s.downstreamURL != "" {
-		s.echoViaDownstream(w, req) // Layer 2 (Module 07, edge role)
+		if s.breaker != nil {
+			s.echoViaDownstreamBreaker(w, req) // Module 08: single guarded call, no retry
+		} else {
+			s.echoViaDownstream(w, req) // Layer 2 (Module 07, edge role)
+		}
 		return
 	}
 	// Layer 1 only (Module 06 path): budget generous for 3 DB attempts + backoff.
@@ -193,6 +216,73 @@ func (s *server) callDownstream(ctx context.Context, orig *http.Request) (int, [
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, body, nil
+}
+
+// newBreaker builds the edge→downstream circuit breaker (Module 08, ADR-CRA-011).
+// The Settings ARE the teaching payload — every field is explicit, not hidden
+// behind a framework. The breaker (not a retry) handles SUSTAINED downstream
+// failure: it trips OPEN and sheds to a fast 503, giving the innermost dependency
+// room to recover.
+func newBreaker(log *slog.Logger) *gobreaker.CircuitBreaker {
+	return gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "edge->downstream",
+		MaxRequests: 1,                // half-open: admit exactly ONE probe before deciding
+		Interval:    0,                // never auto-reset failure counts while closed — count until we trip
+		Timeout:     10 * time.Second, // stay OPEN 10s, then half-open to probe whether downstream recovered
+		ReadyToTrip: func(c gobreaker.Counts) bool {
+			return c.ConsecutiveFailures >= 5 // trip after 5 straight downstream failures
+		},
+		IsSuccessful: func(err error) bool {
+			// THE GATE, on the breaker: a 5xx or transport error is a breaker
+			// failure; a 4xx (errClientError) is NOT — a client error is not the
+			// dependency's fault and must not trip the breaker.
+			return err == nil || errors.Is(err, errClientError)
+		},
+		OnStateChange: func(name string, from, to gobreaker.State) {
+			// Emit the transition so the run can plot the closed/open/half-open
+			// timeline (§VI.3) — the breaker's engagement is a measured quantity.
+			log.Info("breaker state change", "event", "breaker_state",
+				"breaker", name, "from", from.String(), "to", to.String())
+		},
+	})
+}
+
+// echoViaDownstreamBreaker is the mitigated Layer 2 (Module 08). There is NO retry
+// loop here (that was the 27× amplifier) — ONE call, guarded by the breaker. Layer
+// 1 (downstream queryNow) is unchanged and still retries 3×; the mitigation removes
+// the OUTER retries and lets the breaker handle sustained failure by shedding.
+func (s *server) echoViaDownstreamBreaker(w http.ResponseWriter, req *http.Request) {
+	body, err := s.breaker.Execute(func() (any, error) {
+		ctx, cancel := context.WithTimeout(req.Context(), downstreamTimeout) // ONE attempt, no retry
+		defer cancel()
+		status, b, callErr := s.callDownstream(ctx, req)
+		switch {
+		case callErr != nil:
+			return nil, callErr // transport/timeout → breaker failure
+		case status >= 500:
+			return nil, fmt.Errorf("downstream %d", status) // 5xx → breaker failure
+		case status >= 400:
+			return b, errClientError // 4xx → surface it, but do NOT trip the breaker (the gate)
+		default:
+			return b, nil // 2xx → success
+		}
+	})
+
+	switch {
+	case errors.Is(err, gobreaker.ErrOpenState), errors.Is(err, gobreaker.ErrTooManyRequests):
+		// Breaker OPEN (or half-open probe budget spent): fail fast. NO downstream
+		// call was made → 0 db_attempt lines. This shed is the breaker's
+		// distinctive contribution beyond removing the outer retries.
+		http.Error(w, "circuit open", http.StatusServiceUnavailable)
+	case errors.Is(err, errClientError):
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body.([]byte)) // pass the 4xx body through unchanged
+	case err != nil:
+		http.Error(w, "downstream error", http.StatusInternalServerError) // 5xx after a real call
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body.([]byte))
+	}
 }
 
 // queryNow runs the single-layer retry: up to maxAttempts DB attempts, each on

@@ -116,6 +116,9 @@ export class BaselineStack extends cdk.Stack {
     const ssmActivation = fs.readFileSync('fis-ssm-activation.sh', 'utf8');
     const collectorConfig = fs.readFileSync('../observability/collector.yaml', 'utf8');
     const readyGatesCache = this.node.tryGetContext('readyGatesCache') === 'true' ? 'true' : 'false';
+    // Module 08 mitigation: -c breaker=true arms the edge→downstream circuit
+    // breaker (and the app drops the Layer-2 retry loop). Default off = Module 07.
+    const edgeBreaker = this.node.tryGetContext('breaker') === 'true' ? 'true' : 'false';
 
     // One Fargate service per role, identical sidecar set (service + ADOT +
     // SSM agent). The SAME image serves both — the Go binary switches behaviour on
@@ -227,6 +230,7 @@ export class BaselineStack extends cdk.Stack {
     // DOWNSTREAM_URL wired → the edge never runs the DB path directly.
     const edge = makeService('Edge', 'edge', 'cascade', {
       DOWNSTREAM_URL: 'http://downstream.cascade.local:8080',
+      EDGE_BREAKER: edgeBreaker, // Module 08: 'true' arms the breaker + drops Layer-2 retry
     });
 
     // ALB fronts the EDGE only (the downstream is reached via service discovery).
