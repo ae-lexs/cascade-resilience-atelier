@@ -1,89 +1,94 @@
 # Cascade Resilience Atelier
 
-_Architecture, Decisions, and Findings · Eight-Module Arc Complete · July 2026_
+**An empirical study of the compute-resilience failure modes where a protective mechanism becomes a failure amplifier.**
 
-> **A `/health → 200` that validates nothing is a fail-silent failure mode, and the uncoordinated retries of the dead target it protects are a fail-slow one — the same incident seen from two ends.** A load balancer keeps routing to a functionally dead task because its health check tells the truth about the *process* and lies about the *service*; meanwhile each layer's retries multiply load on the innermost dependency by up to 27× (3 × 3 × 3). This atelier deploys a real ALB → ECS Fargate → RDS system and measures both ends empirically, against predictions committed before any infrastructure existed.
+_v1.0 · Author: Alexis Nava ([@ae-lexs](https://github.com/ae-lexs)) · Region of record: `us-east-1` · Status: Complete (eight-module arc — health-check + retry tracks)_
 
-This is the canonical documentation for the repository. It captures the architectural decisions made before the codelab was implemented, the empirical findings produced by running each module on real AWS infrastructure, and an honest ledger of what each run proved against its pre-registered prediction. All six experiments have now run; every verdict is CONFIRMED. The code in this repository is the implementation; the companion `constellational_atelier` Obsidian vault is the long-form curriculum (one document per module); this document is the synthesis.
-
----
-
-## Status
-
-**Work in progress — July 2026.** The codelab is an eight-module arc: two foundation modules build the apparatus (01–02), then the experiment work splits into two independent tracks that share the apparatus — a **health-check track** (03 → 04 → 05) and a **retry-cascade track** (06 → 07 → 08).
-
-| Track | Module | Experiment | State |
-|---|---|---|---|
-| Foundation | 01 Baseline | — | ✅ Complete |
-| Foundation | 02 Apparatus | — | ✅ Complete |
-| Health-check | 03 Health-Check Mythology | Exp 1 — failure | ✅ Complete · **verdict CONFIRMED** |
-| Health-check | 04 Hard-Dependency Validation | Exp 2 — mitigation | ✅ Complete · **verdict CONFIRMED** (mechanism) |
-| Health-check | 05 Soft-Dependency Boundary | Exp 3 — converse trap | ✅ Complete · **verdict CONFIRMED** |
-| Retry-cascade | 06 Retry Cascade, Single Layer | Exp 4 — failure | ✅ Complete · **verdict CONFIRMED** |
-| Retry-cascade | 07 Retry Cascade, Multi Layer | Exp 5 — the 27× claim | ✅ Complete · **verdict CONFIRMED** |
-| Retry-cascade | 08 Cascade Mitigation | Exp 6 — mitigation | ✅ Complete · **verdict CONFIRMED** |
-
-**Both tracks are complete — all six verdicts are in, all six CONFIRMED.** The retry-cascade track landed the headline: the single layer triples DB load (Exp 4, **2.94×**), three uncoordinated layers multiply it by an exact 3 × 3 × 3 (Exp 5, **26.4×**), and the mitigation — delete the outer retries, add a `sony/gobreaker` circuit breaker — collapses it back to single-layer behaviour (Exp 6, **2.94×**) while shedding ~93% of load away from the failing dependency. CI/CD was deliberately descoped (see Decision 9). The companion vault carries three further modules beyond this eight-module arc (09 black-hole; 10–11 static-stability / AZ-failure) not yet built.
+> **Thesis.** In compute, the resilience mechanism and the failure amplifier are frequently the *same object* — and which face you get is decided by **detection latency relative to how long the failure lasts.** A `/health → 200` that validates no dependency is a **fail-silent** failure mode; the uncoordinated retries of the dead target it keeps in rotation are a **fail-slow** one — the same incident seen from two ends. This repository deploys a real ALB → ECS Fargate → RDS system and measures both ends against predictions committed before any infrastructure existed.
 
 ---
 
-## Thesis
+## Table of contents
 
-The atelier tests, empirically and against pre-registered predictions, that the health-check gap and the retry-amplification cascade are the *same incident* seen from two ends. A health check that does not validate its dependencies keeps a dead target in rotation (fail-silent); the downstream retries of that dead target multiply load on the innermost dependency (fail-slow). The apparatus deploys one real ALB → ECS Fargate → RDS system and measures both ends: **time-to-evict (TTE)** and **instance-replacement counts** on the health-check track, and **DB-call-attempt amplification** on the cascade track. Every prediction below was committed before the corresponding infrastructure existed; the findings are the receipts, and the falsifiers are stated up front.
-
----
-
-## Context
-
-The codelab was scoped to satisfy four constraints that are in tension:
-
-1. **Didactic fidelity** — the experiments must make the health-check gap, hard-vs-soft dependency boundaries, and retry amplification visible as observable phenomena in a dashboard, not asserted in prose. Every retry must be a literal `for` loop the reader can count, and a countable OpenTelemetry span.
-2. **Falsifiability** — each experiment carries a pre-registered numeric prediction, a noise band, and a falsifier committed before the run. A finding that lands outside its band is a result, not a failure to hide.
-3. **Cost discipline** — resources must be destroyable after each module. Fargate runs in public subnets (no NAT Gateway), the DB is the smallest instance class, and FIS incurs no idle cost. Full-codelab cost stays in the single-digit dollars with disciplined teardown.
-4. **Determinism over realism** — the measurement substrate must yield the *same* signal across ≥ 3 repetitions. A capacity that autoscales under load would mask the cascade, so the DB is fixed-capacity single-AZ by design.
-
-Each decision below documents how a specific tension was resolved. Each finding documents what the resolution actually delivered when run against real AWS infrastructure in `us-east-1`.
+1. [Abstract](#1-abstract)
+2. [Claims under test](#2-claims-under-test) — the citation surface
+3. [Apparatus and method](#3-apparatus-and-method)
+4. [Experiments and findings](#4-experiments-and-findings)
+5. [Synthesis — eight takeaways](#5-synthesis--eight-takeaways)
+6. [Design decisions](#6-design-decisions)
+7. [Reproduce it yourself](#7-reproduce-it-yourself)
+8. [How to cite](#8-how-to-cite)
+9. [References](#9-references) · [License](#license) · [Changelog](#changelog)
 
 ---
 
-## System Architecture
+## 1. Abstract
+
+This is an **empirical study**, not a tutorial and not an opinion piece. Its unit of work is the *pre-registered experiment*: before any infrastructure was deployed, the expected effect size, a noise band, and a falsifier were committed to a prospective architecture-and-decisions document and an effect-size spine; the experiments were then run against real AWS infrastructure in `us-east-1`; and each load-bearing claim carries a **measured verdict** against that prediction.
+
+Verdicts use three labels:
+
+- **Confirmed** — the measurement matched the prediction within its pre-registered band.
+- **Nuanced** — the direction held but the magnitude, cost, or boundary conditions differ materially from the naive expectation.
+- **Corrected** — the measurement contradicted a stated assumption. *This is the highest-value outcome*: it is the reason to run the experiment instead of paraphrasing the documentation.
+
+The study tests **six load-bearing claims** across two tracks — a health-check track (§VI of the AWS compute-resilience guidance) and a retry-cascade track (§VIII). Its headline is deliberately not folklore-overturning: **the canonical AWS guidance on compute resilience holds — quantitatively.** All six primary claims are **Confirmed**, including the widely-cited **27× retry cascade**, which landed at an exact 3 × 3 × 3. The value is in the two **Corrected** findings at the margin, where reality sharpened the doc: a hardened health check *detects* a dependency failure but does not by itself *recover* from it (detection ≠ recovery), and the resource metric an engineer instinctively reaches for to *see* retry amplification (`DatabaseConnections`) is **structurally blind** to it.
+
+The arc is eight modules: M01–M02 build a deterministic apparatus (single ALB → Fargate → RDS, FIS-wired); M03–M05 are the health-check track (fail-silent, hard-dependency validation, the soft-dependency converse trap); M06–M08 are the retry-cascade track (single-layer 3×, the 27× cascade, and the mitigation that collapses it). The empirical findings in §4 are the receipts. What the study has **not** yet proven — the black-hole traffic effect, the AZ-failure timeline, and whether the cascade *latches* into a metastable state — is stated plainly in §2 as open questions rather than elided.
+
+---
+
+## 2. Claims under test
+
+Each claim has a stable identifier (`CRA-NN`) so it can be cited directly. Follow the link for the experiment, the instrument, the measured number, and the reasoning behind the verdict. Predictions were committed before deployment in the companion vault's effect-size spine.
+
+| ID | Claim under test | Prediction (pre-registered) | Measured result | Verdict |
+|---|---|---|---|---|
+| [CRA-01](#cra-01--a-fail-silent-health-check-never-evicts-the-dead-target) | A `/health → 200` that validates no dependency keeps the ALB routing to a degraded target | **TTE = ∞** (never evicted) | **TTE = ∞** across 3×30-min windows; `HealthyHostCount` flat at 2.0 while `Target_5XX` ~570/min | **Confirmed** |
+| [CRA-02](#cra-02--validating-the-hard-dependency-detects-but-does-not-recover) | `/ready` with a DB-pool check evicts the target in `interval × threshold` | **≈ 30 s ± 5** (5 s × 6) | **38.3 s** (≈ 9.2 s SSM delivery + 26.3 s ALB detection) | **Confirmed** (mechanism) · **Corrected** secondary (fail-open *self-heals*, not persists) |
+| [CRA-03](#cra-03--gating-a-soft-dependency-as-hard-manufactures-an-outage) | Gating a soft dependency in the health check converts a survivable outage into self-inflicted churn | **≥ 1 replacement/burst** (treatment); 0 (control) | treatment **2 / 2 / 4** replacements vs control **0**; `/echo` **99.98%** available in *both* arms | **Confirmed** |
+| [CRA-04](#cra-04--one-retry-layer-triples-the-load-and-the-metric-cannot-see-it) | One retry layer × 3 attempts triples DB-call attempts on the innermost dependency | **3.0× ± 15%** | **2.94×** (histogram caps at exactly 3 — no hidden layer) | **Confirmed** · **Corrected** corroboration (`DatabaseConnections` is pool-blind) |
+| [CRA-05](#cra-05--three-uncoordinated-layers-multiply-to-an-exact-3--3--3) | Three independent retry layers × 3 multiply to 27× — *the headline* | **27× ± 25%** | **26.4×** (every completed cascade an exact 3 × 3 × 3) | **Confirmed** |
+| [CRA-06](#cra-06--constraining-where-retries-live-collapses-the-cascade) | Retry-at-closest-layer + a circuit breaker collapses amplification to ≤ 3× | **≤ 3×** | per-served **2.94×** (cap 3) + breaker sheds `/echo` to `503` @ ~0.13 s (~93% of requests) | **Confirmed** |
+
+**Open questions — owed, not claimed.** Stated for honesty, these are testable but not yet run: the **black-hole problem** (a fast-*failing* target attracts *more* traffic than a healthy peer before eviction — §VI); the **AZ-failure timeline** and **static-stability arithmetic** (data-plane reroute in seconds vs. control-plane replacement in minutes — §VII/§IX, needs a 3-AZ apparatus); and whether the retry cascade **latches** into a metastable state that persists after the trigger is removed (this study measured the *amplifier*, and recovered on fault-lift; it did not demonstrate the *latch*).
+
+---
+
+## 3. Apparatus and method
+
+### System under test
+
+One deterministic stack, deployed from scratch per run and torn down after. The two application services run the **same Go binary**, switching behaviour on `SERVICE_ROLE` / `DOWNSTREAM_URL` / `EDGE_BREAKER`, so the topology is a configuration choice rather than a code fork — which is what keeps the workload constant across the single-layer and multi-layer experiments.
 
 ```mermaid
 flowchart TB
-    subgraph client["Load generator (external)"]
-        K6["k6<br/>Layer 3 — client-layer retries (toggle)"]
-    end
+    K6["k6 load generator<br/>Layer 3 — client-layer retry (toggle)"]
 
-    subgraph vpc["VPC — 2 AZs"]
-        ALB["Application Load Balancer<br/>health check → /health (baseline)<br/>or /ready (mitigation)"]
+    subgraph vpc["VPC — 2 AZs · us-east-1"]
+        ALB["Application Load Balancer<br/>health check → /health (naive)<br/>or /ready (hard-dep validating)"]
 
         subgraph edge["ECS Fargate — edge service"]
-            EDGE["edge app (Go + chi + pgx)<br/>Layer 2 — service-to-service retries (toggle)<br/>/ready validates its DB pool"]
-            EADOT["ADOT sidecar"]
-            ESSM["SSM-agent sidecar (FIS delivery)"]
+            EDGE["edge app (Go + chi + pgx)<br/>Layer 2 — service-to-service retry (toggle)<br/>or sony/gobreaker circuit breaker"]
         end
-
         subgraph down["ECS Fargate — downstream service"]
-            DOWN["downstream app (Go + pgx)<br/>Layer 1 — SDK/DB retries + circuit breaker"]
-            DADOT["ADOT sidecar"]
+            DOWN["downstream app (Go + pgx)<br/>Layer 1 — DB retry (queryNow)"]
         end
-
         RDS[("RDS PostgreSQL 16<br/>single-AZ · db.t4g.micro · fixed capacity<br/>deterministic connection ceiling")]
+        CACHE[("ElastiCache Redis<br/>soft dependency")]
     end
 
     GRAF["Grafana Cloud<br/>target health · RDS metrics · retry-attempt spans"]
-    FIS["AWS FIS<br/>task-network-blackhole-port → RDS (health-check track)<br/>task-network-latency → RDS (cascade track)"]
+    FIS["AWS FIS · aws:ecs:task<br/>blackhole-port → DB (health track)<br/>network-latency → DB (cascade track)"]
 
-    K6 -->|"HTTPS /echo"| ALB
-    ALB -->|"route"| EDGE
+    K6 -->|"HTTP /echo"| ALB --> EDGE
     ALB -.->|"health probe"| EDGE
     EDGE -->|"internal HTTP"| DOWN
-    EDGE -->|"pgxpool (health-check track)"| RDS
+    EDGE -->|"pgxpool (health track)"| RDS
     DOWN -->|"pgxpool (cascade track)"| RDS
-    EADOT -->|"OTLP"| GRAF
-    DADOT -->|"OTLP"| GRAF
+    EDGE -.->|"cache-aside"| CACHE
+    EDGE & DOWN -->|"OTLP"| GRAF
     FIS -.->|"SSM SendCommand → task network path"| DOWN
-    FIS -.->|"SSM SendCommand → task network path"| EDGE
 
     style EDGE fill:#276749,stroke:#68d391,color:#f0fff4
     style DOWN fill:#276749,stroke:#68d391,color:#f0fff4
@@ -91,180 +96,152 @@ flowchart TB
     style RDS fill:#2a4365,stroke:#63b3ed,color:#ebf8ff
 ```
 
-**Why two Fargate services.** The headline 27× prediction requires three *independent* retry layers: the k6 client (Layer 3), the edge → downstream hop (Layer 2), and the downstream → RDS call (Layer 1). A single service can only demonstrate the single-layer 3× multiplier (Experiment 4); the second service is what makes the multi-layer cascade (Experiment 5) real rather than simulated. The full two-service topology lands with the cascade track (Modules 06–08); the health-check track (03–05) exercises the edge service and its DB pool.
+**Why fixed-capacity single-AZ RDS.** An autoscaling database (Aurora Serverless v2) would *mask* the cascade by adding capacity mid-experiment. A deterministic connection ceiling is what makes pool exhaustion and the amplification reproducible across ≥ 3 repetitions.
 
-**Why FIS reaches the task through SSM.** FIS's `aws:ecs:task` network actions are *not* endpoint-only. Every fault is delivered via an **SSM-agent sidecar** that registers the task as an SSM Managed Instance; `enableFaultInjection` on the task definition opens the fault endpoints, but `ssm:SendCommand` is the delivery channel (see Decision 8). This is the single most consequential build-time correction in the project.
+**Why FIS reaches the task through SSM.** FIS's `aws:ecs:task` network actions are *not* endpoint-only. Every fault is delivered via an **SSM-agent sidecar** that registers the task as an SSM Managed Instance; `enableFaultInjection` on the task definition opens the fault endpoints, but `ssm:SendCommand` is the delivery channel. This was the single most consequential build-time correction in the project (recorded as a doc-level correction in the companion vault).
+
+### Instruments — how each number was measured
+
+The measurement method is the load-bearing part of the study; a number without an instrument is an assertion. Every finding in §4 names the instrument that produced it.
+
+| Instrument | Measures | Note on fidelity |
+|---|---|---|
+| **CloudWatch `GetMetricData`** — `HealthyHostCount` (`Minimum`, 60 s) | Time-to-evict (TTE); target-group health | 60 s resolution **cannot resolve a sub-minute transition** — for the ~30 s `/ready` detection window the primary instrument is the 2 s poll below (CRA-02). |
+| **`describe-target-health` polled at 2 s** (CLI-captured) | The ~30 s eviction window at second resolution | Refined *to fit* the pre-registered quantity when the effect size shrank from ∞ (CRA-01) to ~30 s (CRA-02) — matching instrument resolution to effect size. |
+| **CloudWatch Logs Insights** over `db_attempt` lines, `stats count(*) by request_id` | **DB-call-attempt amplification** — a *count ratio* (attempts per originating request) | **Not** an RDS QPS *rate* — a rate dilutes retries across the backoff window and undercounts the cascade. `count_distinct` is approximate (read 1.09 for a true 1.00); group-by-then-count is exact. |
+| **`breaker_state` structured log lines** | The circuit breaker's `closed → open → half-open` timeline (CRA-06) | Emitted on every `gobreaker` state transition; the breaker's *engagement* is itself a measured quantity, not an assumption. |
+| **CloudWatch `DatabaseConnections`** (`AWS/RDS`, 60 s) | Attempted corroboration of amplification | **Structurally blind**: pinned at the pgxpool ceiling (8) across 1× / 3× / 27× / shed, because the pool bounds concurrency (Little's Law). Plotted as the flat *control* line, never as a second amplification signal (CRA-04). |
+| **k6 (`scenarios` API)** | throughput, `http_req_failed`, per-request timing under controlled load | The client-side retry toggle **is Layer 3** of the 27× — an experimental variable, not a fixture. |
+| **AWS FIS `aws:ecs:task`** — `blackhole-port` / `network-latency` | The injected fault (DB unreachable vs. DB-path latency > timeout) | Latency (not blackhole) on the cascade track so RDS genuinely *receives* the amplified attempts; delivered via the SSM sidecar with a `LastStatus=RUNNING` target filter. |
 
 ---
 
-## Decisions
+## 4. Experiments and findings
 
-The full prospective rationale (Context · Considered Options · Trade-offs · Rejected) lives in the companion vault's `00-architecture-and-decisions.md` (ADR-CRA-001…012, MADR format). The compact summary below pairs each decision with its principal rejected alternative and — where the consequence only emerged during implementation — a post-hoc note.
+Direct measurements from `us-east-1`, not estimates. Each subsection is a citable claim (`CRA-NN`).
+
+#### CRA-01 — A fail-silent health check never evicts the dead target
+
+With the ALB probing naive `/health` and FIS blackholing the DB port, the target was **never evicted**: `HealthyHostCount` held flat at **2.0** for the entire ≥ 30-minute window across three repetitions, while `HTTPCode_Target_5XX_Count` climbed to **~570/min** and `/echo` returned 500s throughout (k6 failure 4.93 / 16.08 / 11.13%). A control run served 644k requests at 0.00% failure. **TTE = ∞, as predicted** — the health check told the truth about the *process* and lied about the *service*. That gap is the mythology. **Verdict: Confirmed.**
+
+#### CRA-02 — Validating the hard dependency detects, but does not recover
+
+Retargeting the ALB at `/ready` (which pings the DB pool) evicted the target at a **mean TTE of 38.3 s** (39.4 / 40.1 / 35.5), decomposed into ~9.2 s of SSM fault-delivery latency plus ~26.3 s of ALB detection — exactly the 6-probe × 5 s budget. The detection *mechanism* is in-band and confirmed. But the pre-registered "fail-open, 5xx persists" secondary was **Corrected**: because the FIS fault is *per-task*, ECS replaced each blackholed task with a healthy one that reached the DB, and the service **recovered** (a 23-minute run across all three faults failed just 0.84%). **Detection ≠ recovery** — and a per-task fault self-heals, which reshaped every downstream experiment whose payload is a *storm*. A bonus, filed under the same lesson: rep 1's eviction was erased entirely by 60 s metric smoothing while the 2 s poll caught it. **Verdict: Confirmed (mechanism) · Corrected (secondary).**
+
+#### CRA-03 — Gating a soft dependency as hard manufactures an outage
+
+Mis-gating the soft cache dependency inside `/ready` (as if it were hard) and then failing the cache produced **2 / 2 / 4 instance replacements** per treatment rep (attributed to *"Task failed ELB health checks"*) against **0** in the correctly-designed arm — and replacements kept arriving 9+ minutes in, proving the storm is **non-self-healing** (it used a shared subnet-NACL fault, not the escapable per-task blackhole). The punchline: `/echo` stayed **99.98%** available in *both* arms. The cache outage was fully survivable; gating it as hard converted it into needless, self-inflicted fleet churn that never fixes the cache. **Verdict: Confirmed.**
+
+#### CRA-04 — One retry layer triples the load, and the metric cannot see it
+
+Wrapping the single DB call in a 3-attempt retry (backoff + full jitter, retryable-only gate) under a DB-path latency fault produced **mean 2.94×** amplification (2.96 / 2.96 / 2.91), baseline exact **1.00**. The **attempt histogram capped at exactly 3** (zero requests exceeded it), excluding the > 3.5× hidden-auto-retry falsifier and pinning the single-layer unit the cascade multiplies. The corroboration was **Corrected**: RDS `DatabaseConnections` stayed flat at the pgxpool ceiling (8) in *both* arms — a resource gauge is structurally blind to attempt amplification above a bounded pool (Little's Law), which only strengthens the count-ratio method. **Verdict: Confirmed · Corrected corroboration.**
+
+#### CRA-05 — Three uncoordinated layers multiply to an exact 3 × 3 × 3
+
+Stacking two more independent 3-attempt layers (edge → downstream, and the k6 client) on CRA-04's confirmed single layer produced **mean 26.4×** (25.2 / 27.0 / 27.0, enclosed-request measure), baseline exact **1.00**, every completed cascade decomposing as an exact **3 × 3 × 3**. The instrument was reused *verbatim* from CRA-04, made honest across three hops by **propagating one origin id** (`X-Request-Id` reused by chi's RequestID middleware; `traceparent` by otelhttp) so the denominator stays per-*originating*-request. The 27× is reachable only because every outer timeout is patient enough to let the inner cascade finish — precisely the uncoordinated anti-pattern the number describes. **The canonical headline claim, confirmed on real infrastructure. Verdict: Confirmed.**
+
+#### CRA-06 — Constraining where retries live collapses the cascade
+
+Deleting the two outer retry layers and gating the single edge → downstream call behind a `sony/gobreaker` circuit breaker (retaining only Layer 1, the retry *closest* to the failure) collapsed amplification from **26.4× → per-served mean 2.94×** (2.92 / 2.94 / 2.96, **cap 3 every rep** — no leaked outer retry), numerically identical to CRA-04's isolated single layer. The breaker did the second, distinct job: it tripped `closed → open` in all three reps (~12–18 s after the fault bit) and cycled `open ⇄ half-open` every ~10 s, shedding `/echo` to a fast **`503` @ ~0.13 s** (vs. the cascade's ~19–57 s) — **~93% of requests shed** away from the failing dependency, dropping the all-originating aggregate to ≈ 0.002×. The cascade is **bounded, not eliminated**: a retry rides out a *transient* blip, a breaker sheds a *sustained* outage; using retries for both is what built the 27×. **Verdict: Confirmed.**
+
+---
+
+## 5. Synthesis — eight takeaways
+
+The two tracks are the same incident seen from two ends: a fail-silent health check keeps a dead target in rotation, and the retries into that target amplify load on the innermost dependency. Detection latency is the hinge.
+
+1. **Liveness is not readiness, and the difference is a fail-silent outage.** A `/health` reporting only "the process is up" keeps a functionally dead task in rotation indefinitely (TTE = ∞, CRA-01). The failure is invisible precisely because the signal everyone trusts stays green.
+2. **Validating the hard dependency closes the gap — but detection is not recovery.** `/ready` evicts the dead target in one health-check budget (CRA-02), yet the wall-clock TTE also carries the fault-delivery latency, and eviction alone does not restore service. Measure end-to-end, and know which term is which.
+3. **Gating a soft dependency as hard is the converse trap.** It converts a fully survivable outage (99.98% available) into a self-inflicted, non-self-healing replacement storm that never fixes the dependency (CRA-03).
+4. **Instrument resolution must match effect size.** A 60 s metric roll-up erased an eviction a 2 s poll caught (CRA-02). Determinism in the substrate is worthless if the measurement smears the signal away.
+5. **Amplification is a count, not a rate — and a resource gauge can be blind to it.** One retry layer triples DB-call attempts (CRA-04); a QPS rate dilutes that across the backoff window, and `DatabaseConnections` cannot see it at all because the pool bounds concurrency (Little's Law). Count the attempt events at their source.
+6. **Uncoordinated retries multiply, exactly.** Three independent layers compose to an exact 3 × 3 × 3 = 26.4× (CRA-05) — reachable only because every outer timeout is patient enough to let the inner cascade finish. A retry that absorbs a *transient* blip becomes a compounding amplifier under a *sustained* one.
+7. **The cure is to constrain where retries live, not to remove them.** Keeping only the retry closest to the failure and adding a circuit breaker collapses 26.4× → 2.94× (CRA-06). The breaker does the job the outer retries were doing badly: under sustained failure it trips open and *sheds* instead of patiently retrying into a dependency that is already down.
+8. **A load-shedding cure must be measured by decomposition, not the mean.** Once the breaker sheds, the aggregate amplification falls to ≈ 0 — which both undersells the result and could hide a leaked retry. The adjudicating measurement is the per-served cap (= 3) plus the shed fraction, not the shed-diluted average.
+
+---
+
+## 6. Design decisions
+
+The full prospective rationale (Context · Considered Options · Trade-offs · Rejected) lives in the companion vault's `00-architecture-and-decisions.md` (ADR-CRA-001…012, MADR format). The compact summary pairs each decision with its principal rejected alternative and — where the consequence emerged only during implementation — a post-hoc note.
 
 | # | Decision | Choice | Principal rejected alternative | Post-hoc consequence |
 |---|---|---|---|---|
-| 1 | App language + framework | Go 1.26 + chi + pgx (`pgxpool`) | Java + Spring + resilience4j (annotations *hide* the retries the codelab exists to expose); Python + FastAPI (asyncio/GIL p99 confounder) | Every retry is a literal `for` loop the reader can count, and one OTel span per DB attempt — the amplification is provable, not inferred |
+| 1 | App language + framework | Go 1.26 + chi + pgx (`pgxpool`) | Java + Spring + resilience4j (annotations *hide* the retries the study exists to expose); Python + FastAPI | Every retry is a literal `for` loop the reader can count, and one OTel span per DB attempt — amplification is provable, not inferred |
 | 2 | Build tool | `go mod` + `go build` | A separate task runner | — |
-| 3 | Infra-as-code | AWS CDK v2, **TypeScript** | CDK Go (jsii `jsii.String(...)` ceremony buries intent); Terraform | Polyglot repo (Go app `app/`, TS infra `cdk/`); FIS is L1 `CfnExperimentTemplate` in every binding, so TS wins purely on ECS/ALB/RDS readability |
-| 4 | Container runtime | ECS Fargate | EC2 (capacity to manage) | Task defs must carry `enableFaultInjection`, `pidMode: task`, explicit `runtimePlatform` — and an SSM sidecar (Decision 8) |
-| 5 | Database | RDS PostgreSQL 16, single-AZ, `db.t4g.micro`, fixed capacity | Aurora Serverless v2 — ACU autoscaling *masks* contention by adding capacity mid-experiment | Deterministic connection ceiling → pool exhaustion and the cascade are reproducible across ≥ 3 reps |
-| 6 | Observability | ADOT + Grafana Cloud + CloudWatch Logs Insights | X-Ray-only; CloudWatch-only | Amplification = a count of `db_attempt` log lines per `request_id`; **`count_distinct` is approximate — the query must group-by-then-count** (baseline read 1.09 wrong vs 1.00 right) |
-| 7 | Load testing | k6 (`scenarios` API) | JMeter; Locust | k6's client-side retry IS Layer 3 of the 27× — an experimental variable, not a fixture |
-| 8 | Chaos engineering | AWS FIS `aws:ecs:task` network actions — **blackhole-port** (health-check track) / **latency** (cascade track) | Server-side throttle (static config, not injectable/reversible) | **Corrected after the M02 deploy:** faults require the full SSM machinery — a 3rd per-task sidecar, a managed-instance role, task-role + FIS-role SSM grants, and a `LastStatus=RUNNING` target filter — else every run fails pre-flight with *"not registered as a SSM managed instance."* Latency (not blackhole) on the cascade track so RDS genuinely receives the amplified attempts |
-| 9 | CI/CD | **Rejected — out of scope** | GitHub Actions + OIDC + six-layer fork isolation | Experiments are deployed, run, and measured by hand, one controlled run at a time; a pipeline adds a public-repo attack surface for zero experimental gain |
-| 10 | Local toolchain | Docker + Compose only on host | Dev Containers; Nix | `~/.aws` mounted **`:rw`** so the SDK can refresh the cached SSO token |
-| 11 | Circuit breaker | `sony/gobreaker` | Hand-rolled ~80-line breaker; a larger framework | The breaker's `closed/open/half-open` state machine *is* the Module 08 teaching payload — reading its source is the lesson |
-| 12 | Health endpoint envelope | `/health` (liveness, validates nothing) + `/ready` (hard-deps-only readiness) | A single endpoint | One apparatus, three pedagogical states, one knob: which endpoint the ALB probes and what `/ready` validates. Gating a soft dep (cache) in `/ready` is the converse trap (Exp 3) |
+| 3 | Infra-as-code | AWS CDK v2, **TypeScript** | CDK Go (jsii ceremony); Terraform | FIS is L1 `CfnExperimentTemplate` in every binding, so TS wins on ECS/ALB/RDS readability |
+| 4 | Container runtime | ECS Fargate | EC2 (capacity to manage) | Task defs carry `enableFaultInjection`, `pidMode: task`, explicit `runtimePlatform`, and an SSM sidecar (Decision 8) |
+| 5 | Database | RDS PostgreSQL 16, single-AZ, `db.t4g.micro`, fixed capacity | Aurora Serverless v2 — ACU autoscaling *masks* the cascade | Deterministic connection ceiling → pool exhaustion and amplification reproducible across ≥ 3 reps |
+| 6 | Observability | ADOT + Grafana Cloud + CloudWatch Logs Insights | X-Ray-only; CloudWatch-only | Amplification = a count of `db_attempt` lines per `request_id`; **group-by, not `count_distinct`** (which read 1.09 vs a true 1.00) |
+| 7 | Load testing | k6 (`scenarios` API) | JMeter; Locust | k6's client-side retry **is Layer 3** of the 27× — a variable, not a fixture |
+| 8 | Chaos engineering | AWS FIS `aws:ecs:task` — **blackhole-port** / **latency** | Server-side throttle (not injectable/reversible) | **Corrected after deploy:** faults require the full SSM machinery — sidecar, managed-instance role, task/FIS SSM grants, `LastStatus=RUNNING` filter — else every run fails pre-flight |
+| 9 | Circuit breaker | `sony/gobreaker` | Hand-rolled breaker; a larger framework | The `closed/open/half-open` state machine *is* the CRA-06 teaching payload; a static-threshold breaker is deliberately the simplest mechanism that demonstrates the collapse |
+| 10 | CI/CD | **Rejected — out of scope** | GitHub Actions + OIDC | Experiments are deployed, run, and measured by hand, one controlled run at a time; a pipeline adds a public-repo attack surface for zero experimental gain |
+| 11 | Local toolchain | Docker + Compose only on host | Dev Containers; Nix | `~/.aws` mounted **`:rw`** so the SDK can refresh the cached SSO token |
+| 12 | Health endpoint envelope | `/health` (liveness) + `/ready` (hard-deps-only) | A single endpoint | One apparatus, three pedagogical states, one knob: which endpoint the ALB probes and what `/ready` validates |
 
 ---
 
-## Predictions (pre-registered)
+## 7. Reproduce it yourself
 
-Every experiment's prediction, noise band, and falsifier were committed in the execution plan's effect-size spine *before* the run. This is the falsifiability contract — the operational metric for Modules 06–08 was later refined from "RDS QPS ratio" to "DB-call-attempt *count* ratio" (a rate dilutes and undercounts the cascade), but the predicted values and falsifier bounds are unchanged from pre-registration.
-
-| Exp | Module | Predicted quantity | Prediction | Falsifier |
-|---|---|---|---|---|
-| 1 | 03 | Time-to-evict, naive `/health` | **TTE = ∞** (target stays "healthy" ≥ 30 min) | any finite TTE |
-| 2 | 04 | Time-to-evict, `/ready` (DB pool) | **TTE ≈ 30 s** (interval 5 s × threshold 6), ± 5 s | TTE ≫ 30 s → a masking layer |
-| 3 | 05 | Instance replacements per cache-outage burst | **≥ 1** (soft-dep-as-hard arm); **0** (correct arm) | 0 in treatment arm |
-| 4 | 06 | DB-attempt amplification (1 layer × 3) | **3.0×** ± 15% | < 2.5× or > 3.5× (a hidden retry layer) |
-| 5 | 07 | DB-attempt amplification (3 layers × 3) | **27×** ± 25% — *the headline claim* | < 15× or > 40× |
-| 6 | 08 | DB-attempt amplification (breaker + kill upper retries) | **≤ 3×** | > 5× |
-
----
-
-## Empirical Findings
-
-Direct measurements from `us-east-1`, not estimates. All six experiments have run; every verdict is CONFIRMED.
-
-| Module | Configuration | Prediction | Measured | Verdict |
-|---|---|---|---|---|
-| **01 Baseline** | ALB → Fargate → RDS · naive `/health → 200` · no retries | (control) | Deployed; `/health` returns 200 validating no dependency — the anti-baseline | — |
-| **02 Apparatus** | + `db_attempt` instrumentation · ADOT + SSM sidecars · FIS templates · k6 | baseline amp = 1.0 | **1.00** (group-by-`request_id` count; `count_distinct` mis-read 1.09) | — |
-| **03 Exp 1 — Health-Check Mythology** | ALB probes `/health` · FIS **blackholes** the DB | TTE = ∞ | **TTE = ∞** across 3 reps — `HealthyHostCount` flat at 2.0 the whole ≥ 30-min window while `5XX` climbed to ~570/min; k6 failure 4.93 / 16.08 / 11.13% | ✅ **CONFIRMED** |
-| **04 Exp 2 — Hard-Dependency Validation** | ALB probes `/ready` (DB-pool ping) · same fault | TTE ≈ 30 s ± 5 | **mean 38.3 s** (reps 39.4 / 40.1 / 35.5) = ~9.2 s SSM fault-delivery + ~26.3 s ALB detection (exactly 6 probes × 5 s) | ✅ **CONFIRMED** (mechanism); fail-open secondary **falsified** |
-| **05 Exp 3 — Soft-Dependency Boundary** | `/ready` mis-gates the cache as hard · cache blackholed | ≥ 1 replacement / burst | control **0**, treatment **2 / 2 / 4** replacements (*"Task failed ELB health checks"*); `/echo` **99.98%** available in *both* arms | ✅ **CONFIRMED** |
-| **06 Exp 4 — Retry Cascade, Single Layer** | 1 layer × 3 attempts · FIS **latency** > per-attempt timeout | 3.0× ± 15% | **mean 2.94×** (reps 2.96 / 2.96 / 2.91); baseline exact 1.00; attempt histogram caps at exactly 3 (zero > 3) → the > 3.5× hidden-retry falsifier excluded | ✅ **CONFIRMED** |
-| **07 Exp 5 — Retry Cascade, Multi Layer** | 3 independent layers × 3 · one origin id across all hops | 27× ± 25% | **mean 26.4×** (reps 25.2 / 27.0 / 27.0, enclosed-request measure); every completed cascade an exact **3 × 3 × 3 = 27**; baseline exact 1.00 | ✅ **CONFIRMED** — *the headline claim* |
-| **08 Exp 6 — Cascade Mitigation** | `sony/gobreaker` + kill the upper retry layers | ≤ 3× | **per-served mean 2.94×** (reps 2.92 / 2.94 / 2.96, cap 3 every rep) = single-layer behaviour restored; breaker sheds `/echo` to `503` @ ~0.13 s (~93% of requests), all-originating aggregate ≈ 0.002× | ✅ **CONFIRMED** |
-
-### Per-module commentary (completed modules)
-
-- **M01 — Baseline is the anti-baseline.** A single Go edge service behind an ALB, backed by a fixed-capacity single-AZ RDS instance, with a naive `/health → 200` that validates nothing downstream and a DB-touching `/echo`. No retries, no breaker. This is the control the health-check track perturbs. Three deviations from the plan's prose were recorded honestly (public not private subnets; one service not two at this stage; a cohesive repo layout).
-- **M02 — The apparatus, corrected after a real deploy.** The shared instrument: one `db_attempt` structured log line (and OTel span) per DB attempt — counting these per `request_id` in a fault window *is* the amplification metric. The task grew to three containers (app + ADOT + SSM-agent) once the FIS/SSM machinery proved mandatory. The measurement-source table pins each quantity to its home: amplification ← Logs Insights, TTE ← `HealthyHostCount`, replacement count ← ECS task-state. Headline fact: **the baseline amplification read exactly 1.00 once the query grouped-then-counted rather than `count_distinct`-ing.**
-- **M03 — The health check told the truth about the process and lied about the service.** With the ALB probing naive `/health` and FIS blackholing the DB, the target was **never evicted** — `HealthyHostCount` held flat at 2.0 for the entire ≥ 30-minute window while `HTTPCode_Target_5XX_Count` climbed to ~570/min and `/echo` returned 500s throughout. A control run served 644k requests at 0.00% failure. **TTE = ∞, as predicted. That gap between a healthy-looking process and a dead service is the mythology.**
-- **M04 — Hard-dependency validation works — and ECS self-heals per-task faults.** Retargeting the ALB at `/ready` (which pings the DB pool) evicted the target at a **mean TTE of 38.3 s**, decomposed into ~9.2 s of SSM fault-delivery latency plus ~26.3 s of ALB detection (exactly the 6-probe × 5-s budget). The detection *mechanism* is in-band and confirmed. But the pre-registered "fail-open, 5xx persists" secondary was **falsified**: because the FIS fault is *per-task*, ECS replaced each blackholed task with a healthy one that reached the DB, and the service **recovered** — a 23-minute k6 run across all three faults failed just 0.84%. Carried forward: *Module 05 must inject its cache fault cache-side, or the storm will self-heal.* A bonus lesson — rep 1's eviction was erased entirely by 60-s metric smoothing while a 2-s poll caught it: **match instrument resolution to effect size.**
-- **M05 — The converse trap: a survivable outage turned into self-inflicted churn.** Mis-gating the soft cache dependency inside `/ready` (as if it were hard) and then failing the cache produced **2 / 2 / 4 instance replacements** per treatment rep (attributed to *"Task failed ELB health checks"*) against **0** in the correctly-designed arm — and the replacements kept arriving 9+ minutes into the fault, proving the storm is **non-self-healing**. The punchline: `/echo` stayed **99.98%** available in *both* arms — **the cache outage was fully survivable, and gating it as a hard dependency converted it into needless, self-inflicted fleet churn that never fixes the cache.**
-- **M06 — One retry layer triples the load, and the histogram rules out a hidden layer.** Wrapping the single DB call in a 3-attempt retry (backoff + full jitter, retryable-only gate) under a DB-path latency fault produced **mean 2.94×** amplification (reps 2.96 / 2.96 / 2.91), baseline exact **1.00**. The measurement is a **count ratio** — `db_attempt` log lines per `request_id`, group-by (never `count_distinct`) — deliberately *not* an RDS QPS rate, which dilutes across the backoff window and undercounts. The **attempt histogram capped at exactly 3** (zero requests exceeded it), which excludes the > 3.5× hidden-auto-retry falsifier and pins the single-layer unit the 27× multiplies. A corroboration correction: RDS `DatabaseConnections` stayed flat at the pgxpool ceiling (8) in both arms — a resource gauge is *structurally blind* to attempt amplification above a bounded pool, which only strengthens the count-ratio thesis.
-- **M07 — Three uncoordinated layers multiply to an exact 3 × 3 × 3 = 27.** Stacking two more independent 3-attempt layers (edge → downstream, and the k6 client) on M06's confirmed single layer produced **mean 26.4×** (reps 25.2 / 27.0 / 27.0, enclosed-request measure), baseline exact **1.00**, every completed cascade decomposing as an exact **3 × 3 × 3**. The instrument was reused *verbatim* from M06, made honest across three hops by **propagating one origin id** (`X-Request-Id` reused by chi's RequestID middleware; `traceparent` by otelhttp) so the denominator stays per-*originating*-request. The 27× is reachable only because every outer timeout is patient enough to let the inner cascade finish (the nested-timeout budget) — precisely the uncoordinated anti-pattern the number describes. **The headline claim, confirmed on real infrastructure.**
-- **M08 — The cure: constrain where the retries live.** Deleting the two outer retry layers and gating the single edge → downstream call behind a `sony/gobreaker` circuit breaker (retaining only Layer 1, the retry *closest* to the failure) collapsed amplification from **26.4× → per-served mean 2.94×** (reps 2.92 / 2.94 / 2.96, **cap 3 every rep** = no leaked outer retry) — numerically identical to M06's isolated single layer. The breaker did the second, distinct job: it tripped `closed → open` in all three reps (~12–18 s after the fault bit) and cycled `open ⇄ half-open` every ~10 s, shedding `/echo` to a fast **`503` @ ~0.13 s** (vs M07's ~19–57 s) — **~93% of requests shed away from the failing dependency**, so RDS saw only ~273 amplified attempts/rep and the all-originating aggregate fell to ≈ 0.002×. **The cascade is bounded, not eliminated: a retry rides out a *transient* blip, a breaker sheds a *sustained* outage; using retries for both is what built the 27×.**
-
----
-
-## Synthesis — Takeaways
-
-Both tracks are complete; all six verdicts are CONFIRMED. These takeaways are the ones the evidence now supports.
-
-```mermaid
-flowchart TB
-    subgraph proven["Proven — health-check track (Exp 1-3)"]
-        T1["Liveness ≠ readiness<br/>naive /health → TTE = ∞"]
-        T2["Validate hard deps in /ready<br/>→ TTE ≈ detection budget"]
-        T3["Never gate soft deps<br/>→ self-inflicted churn, cache still down"]
-        T1 --> T2 --> T3
-    end
-    subgraph cascade["Proven — retry-cascade track (Exp 4-6)"]
-        C4["Single layer → 2.94×"]
-        C5["Three layers → 26.4× (exact 3×3×3)"]
-        C6["Breaker + kill upper retries → 2.94× + shed"]
-        C4 --> C5 --> C6
-    end
-    proven -.->|"same incident, other end"| cascade
-
-    style proven fill:#276749,stroke:#68d391,color:#f0fff4
-    style cascade fill:#276749,stroke:#68d391,color:#f0fff4
-```
-
-**1. Liveness is not readiness, and the difference is a fail-silent outage.** A `/health` that reports only "the process is up" keeps a functionally dead task in the load balancer's rotation indefinitely (TTE = ∞, M03). The failure is invisible precisely because the signal everyone trusts stays green.
-
-**2. Validating the hard dependency in `/ready` closes the gap — at the cost of the detection budget.** Probing a real DB-pool check evicts the dead target in ≈ one health-check budget (M04). The mechanism is deterministic; the wall-clock TTE also carries the fault-delivery latency of whatever injects the failure, so *measure end-to-end and know what each term is.*
-
-**3. Gating a soft dependency as if it were hard is the converse trap.** Including a cache in `/ready` converts a fully survivable outage (99.98% available) into a self-inflicted, non-self-healing replacement storm that never fixes the cache (M05). Hard dependencies belong in the readiness check; soft ones never do.
-
-**4. Instrument resolution must match effect size.** A 60-s metric roll-up erased an eviction that a 2-s poll caught (M04). Determinism in the substrate is worthless if the measurement smears the signal away.
-
-**5. Pre-registration turns surprises into findings, not embarrassments.** Every prediction here carried a band and a falsifier committed before the run. That is why M04's falsified fail-open secondary is a documented result — with a mechanism (per-task ECS self-heal) — rather than a quietly-dropped expectation. Refining the M06–08 metric from a QPS *rate* to an attempt *count* was an operational-definition fix, explicitly *not* a goalpost move.
-
-**6. The headline held: uncoordinated retries multiply, exactly.** One layer triples DB load (M06, **2.94×**, histogram capped at 3 — no hidden layer); three independent layers multiply to an exact **3 × 3 × 3 = 26.4×** (M07) — reachable only because every outer timeout is patient enough to let the inner cascade finish, which *is* the uncoordinated anti-pattern. A retry that absorbs a *transient* blip becomes a compounding amplifier under a *sustained* one.
-
-**7. The cure is to constrain where retries live, not to remove them.** Keeping only the retry closest to the failure and adding a circuit breaker at the service-to-service boundary collapsed the cascade **26.4× → 2.94×** (M08, per-served cap 3) — single-layer behaviour restored. The breaker does the job the outer retries were doing badly: under *sustained* failure it trips open and **sheds** (~93% of requests to a fast `503`, RDS load cut to a trickle) instead of patiently retrying into a dependency that is already down. Retry for the transient; break for the sustained.
-
-**8. A load-shedding cure must be measured by decomposition, not by the mean.** Once the breaker sheds, the aggregate amplification over *all* originating requests falls to ≈ 0 — which both undersells the result and could hide a leaked retry. The adjudicating measurement is the **per-served cap** (= 3, proving only one layer survives) plus the **shed fraction** (the breaker's distinct contribution), not the shed-diluted average.
-
----
-
-## Companion Documentation
-
-The long-form module walkthroughs — full procedural steps, all CDK code, every CloudWatch Logs Insights query, the empirical numbers above with their full provenance, and an extensive pitfalls catalogue — live in the companion **`constellational_atelier`** Obsidian vault under `Cascade Resilience Atelier/`:
-
-- `CASCADE_RESILIENCE_ATELIER_EXECUTION_PLAN.md` — task register, module dependency map, and the pre-registered effect-size spine (Section VII).
-- `00-architecture-and-decisions.md` — the full prospective decisions document (ADR-CRA-001…012, MADR format).
-- `01-baseline-deployment.md` … `08-cascade-mitigation.md` — one document per module (all eight authored, each with its run verdict in Section VII).
-
-The code in this repository is the implementation. The atelier is the curriculum. This document is the synthesis.
-
----
-
-## Run It Yourself
-
-Prerequisites: Docker 24+ with Compose v2; AWS CLI v2 configured with SSO (profile `cascade-resilience-atelier`); an AWS account with CDK bootstrapped in `us-east-1`. Nothing else runs on the host — Go, the AWS CDK CLI, k6, and the AWS CLI all live in containers (`docker-compose.yml`). `~/.aws` is mounted read-write so the SDK can refresh the SSO token.
+Prerequisites: Docker 24+ with Compose v2; AWS CLI v2 with SSO (profile `cascade-resilience-atelier`); an account with CDK bootstrapped in `us-east-1`; a Grafana Cloud OTLP endpoint. Nothing else runs on the host — Go, the CDK CLI, k6, and the AWS CLI all live in containers. `~/.aws` is mounted read-write so the SDK can refresh the SSO token.
 
 ```bash
 git clone https://github.com/ae-lexs/cascade-resilience-atelier.git
 cd cascade-resilience-atelier
 aws sso login --profile cascade-resilience-atelier
 
-# Build the Go edge service and deploy the two stacks
-docker compose run --rm build go build ./...
-docker compose run --rm cdk cdk deploy CascadeBaseline --require-approval never
-docker compose run --rm cdk cdk deploy CascadeApparatus --require-approval never
+# Deploy the two-service stack (add -c breaker=true for the CRA-06 mitigation arm)
+docker compose run --rm -e GRAFANA_OTLP_ENDPOINT cdk npx cdk deploy CascadeBaseline CascadeApparatus --require-approval never
 
-# Drive load at the ALB (URL is a CascadeBaseline stack output)
-docker compose run --rm -e ALB_URL="http://<alb-dns>" build \
-  sh -c 'k6 run loadtest/sustained.js'
+# Drive load (RETRIES=2 arms the client-side Layer 3 for the 27× cascade)
+docker run --rm -e ALB_URL="http://<alb-dns>" -e RETRIES=2 -v "$PWD/loadtest:/t" grafana/k6 run /t/cascade-trigger.js
+
+# During the run, start a FIS experiment (template id is a CascadeApparatus output), then
+# read the verdict with the amplification query (group-by request_id, not count_distinct).
+aws fis start-experiment --experiment-template-id <DbLatencyTemplateId>
 ```
 
-The apparatus stack carries the FIS experiment templates; trigger an experiment from the FIS console (or `aws fis start-experiment`) during a k6 run, then read the verdict with the queries in `observability/queries/` (`tte.cwli`, `db-attempt-amplification.cwli`, `instance-replacement.cwli`). `cdk destroy CascadeApparatus CascadeBaseline` tears everything down — FIS has no idle cost, so the standing spend is only ALB + RDS + Fargate. **Deployment is manual by design (Decision 9): there is no CI/CD pipeline.**
+`cdk destroy CascadeApparatus CascadeBaseline` tears everything down; FIS has no idle cost, so standing spend is only ALB + RDS + Fargate. **Deployment is manual by design (Decision 10): there is no CI/CD pipeline.** The long-form module walkthroughs — every step, all CDK, every Logs Insights query, and the pitfalls catalogue — live in the companion `constellational_atelier` vault under `Cascade Resilience Atelier/` (one document per module, each with its run verdict in Section VII).
 
 ---
 
-## References
+## 8. How to cite
+
+Cite the study, or a specific claim by its stable identifier:
+
+> Nava, A. (2026). *Cascade Resilience Atelier* (v1.0) [Empirical study]. GitHub. https://github.com/ae-lexs/cascade-resilience-atelier
+
+For a single claim, reference its ID and heading — e.g. **CRA-05 (three uncoordinated retry layers multiply to an exact 3 × 3 × 3 = 26.4×)**. Each `CRA-NN` in §2 is a stable anchor. This atelier is the compute-substrate half of the **Resilience series**; its companion is the [Lambda Resilience Atelier](https://github.com/ae-lexs/lambda-resilience-atelier) (`LRA-NN`), which covers the Lambda concurrency and cold-start failure modes.
+
+---
+
+## 9. References
 
 | Source | Publisher | URL |
 |---|---|---|
 | Implementing health checks — David Yanacek | Amazon Builders' Library | https://aws.amazon.com/builders-library/implementing-health-checks/ |
 | Timeouts, retries, and backoff with jitter — Marc Brooker | Amazon Builders' Library | https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/ |
+| Using load shedding to avoid overload — David Yanacek | Amazon Builders' Library | https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/ |
+| Static stability using Availability Zones — Colm MacCárthaigh | Amazon Builders' Library | https://aws.amazon.com/builders-library/static-stability-using-availability-zones/ |
 | AWS FIS — `aws:ecs:task` actions | AWS FIS User Guide | https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html |
-| Testing network resilience of Fargate workloads with FIS | AWS Containers Blog | https://aws.amazon.com/blogs/containers/testing-network-resilience-of-aws-fargate-workloads-on-amazon-ecs-using-aws-fault-injection-service/ |
-| Use fault injection with ECS / Fargate | AWS ECS Developer Guide | https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fault-injection.html |
-| Health checks for ALB target groups (interval/threshold ranges) | AWS ELB User Guide | https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html |
-| RDS PostgreSQL — connection limits / `max_connections` | AWS RDS User Guide | https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_PostgreSQL.html |
-| AWS CDK v2 Developer Guide | AWS | https://docs.aws.amazon.com/cdk/v2/guide/home.html |
+| Health checks for ALB target groups | AWS ELB User Guide | https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html |
 | `pgx` · `chi` · `sony/gobreaker` | GitHub | https://github.com/jackc/pgx · https://github.com/go-chi/chi · https://github.com/sony/gobreaker |
-| ADOT · k6 scenarios | AWS · Grafana Labs | https://aws-otel.github.io/ · https://grafana.com/docs/k6/latest/using-k6/scenarios/ |
+| AWS CDK v2 Developer Guide · k6 scenarios | AWS · Grafana Labs | https://docs.aws.amazon.com/cdk/v2/guide/home.html · https://grafana.com/docs/k6/latest/using-k6/scenarios/ |
 | Principles of Chaos Engineering | — | https://principlesofchaos.org/ |
-
----
 
 ## License
 
 MIT.
 
----
-
 ## Changelog
 
 | Version | Date | Changes |
 |---|---|---|
-| v0.6 | July 2026 | **Retry-cascade track complete — all three verdicts CONFIRMED.** Updated the status table, empirical-findings table, and per-module commentary (added M06/M07/M08) with the run numbers: Exp 4 single-layer **2.94×** (histogram capped at 3, no hidden layer); Exp 5 multi-layer **26.4×** (exact 3 × 3 × 3, the headline); Exp 6 mitigation **26.4× → 2.94×** (per-served cap 3, `sony/gobreaker` sheds `/echo` to `503` @ ~0.13 s, ~93% of requests). Rewrote the synthesis: the "open frontier" mermaid subgraph is now proven (green), takeaway 6 reframed from hypothesis to confirmed, added takeaways 7 (constrain where retries live) and 8 (decompose a load-shedding cure — cap vs. shed). Retitled "synthesis-so-far" → "synthesis"; header tagline → "Eight-Module Arc Complete." Noted three further vault modules (09 black-hole; 10–11 static-stability / AZ-failure) beyond this arc, not yet built. |
-| v0.5 | July 2026 | Initial public README. Documents the eight-module arc with the health-check track (Modules 01–05 / Experiments 1–3) **complete** and its three verdicts CONFIRMED, and the retry-cascade track (Modules 06–08 / Experiments 4–6) pre-registered but **not yet run**. Includes the compact 12-row decisions table (Go + chi + pgx; CDK TypeScript; RDS single-AZ fixed-capacity; FIS `aws:ecs:task` with the corrected SSM-sidecar requirement; `/health`+`/ready` envelope; CI/CD rejected), the pre-registered prediction spine, the empirical-findings table with per-module commentary, and a synthesis-so-far that keeps the 27× cascade explicitly labeled a hypothesis. To be revised as the cascade-track verdicts land. |
+| v1.0 | July 2026 | **Citable empirical-study restructure — eight-module arc complete, all six primary claims Confirmed.** Reorganized from the narrative v0.x into the study format: an Abstract framing the work as pre-registered experiment with three verdict labels (Confirmed / Nuanced / Corrected); a **`CRA-NN` claim ledger** (§2) as the citation surface, with the two health-track corrections (detection ≠ recovery; `DatabaseConnections` pool-blindness) surfaced as `Corrected`; an Instruments table (how each number was measured); per-claim findings (§4, CRA-01…06); an eight-point synthesis; the 12-row decisions table; and a **How to cite** section pairing this atelier with the Lambda Resilience Atelier under the Resilience series. Open questions (black-hole, AZ-failure timeline, cascade metastability) stated as owed rather than elided. Numbers: TTE = ∞ (CRA-01); 38.3 s (CRA-02); 2/2/4 vs 0 (CRA-03); 2.94× (CRA-04); 26.4× exact 3×3×3 (CRA-05); 26.4× → 2.94× + 93% shed (CRA-06). |
+| v0.6 | July 2026 | Retry-cascade track complete — Modules 06–08 verdicts (2.94× / 26.4× / 2.94×) folded into the narrative README; synthesis reframed from "open frontier" to proven. |
+| v0.5 | July 2026 | Initial public README (health-check track complete; retry track pre-registered but not yet run). |
+
+---
+
+_The code in this repository is the implementation. The companion `constellational_atelier` vault is the curriculum (one document per module). This document is the citable synthesis._
