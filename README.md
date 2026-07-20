@@ -2,7 +2,7 @@
 
 **An empirical study of the compute-resilience failure modes where a protective mechanism becomes a failure amplifier.**
 
-_v1.0 · Author: Alexis Nava ([@ae-lexs](https://github.com/ae-lexs)) · Region of record: `us-east-1` · Status: Complete (eight-module arc — health-check + retry tracks)_
+_v1.1 · Author: Alexis Nava ([@ae-lexs](https://github.com/ae-lexs)) · Region of record: `us-east-1` · Status: Complete (eight-module arc — health-check + retry tracks)_
 
 > **Thesis.** In compute, the resilience mechanism and the failure amplifier are frequently the *same object* — and which face you get is decided by **detection latency relative to how long the failure lasts.** A `/health → 200` that validates no dependency is a **fail-silent** failure mode; the uncoordinated retries of the dead target it keeps in rotation are a **fail-slow** one — the same incident seen from two ends. This repository deploys a real ALB → ECS Fargate → RDS system and measures both ends against predictions committed before any infrastructure existed.
 
@@ -114,6 +114,8 @@ The measurement method is the load-bearing part of the study; a number without a
 | **k6 (`scenarios` API)** | throughput, `http_req_failed`, per-request timing under controlled load | The client-side retry toggle **is Layer 3** of the 27× — an experimental variable, not a fixture. |
 | **AWS FIS `aws:ecs:task`** — `blackhole-port` / `network-latency` | The injected fault (DB unreachable vs. DB-path latency > timeout) | Latency (not blackhole) on the cascade track so RDS genuinely *receives* the amplified attempts; delivered via the SSM sidecar with a `LastStatus=RUNNING` target filter. |
 
+> **Measurement standard.** These per-experiment instruments sit on the series' shared grammar: the four golden signals operationalized as **RED** (rate · errors · duration, per boundary) + **USE** (utilization · saturation · errors, per resource), bound by **Little's Law** (`L = λ × W` — concurrency = throughput × latency). The one signal being retrofitted is **saturation** — the pgxpool *acquire-wait* queue, the positive form of the `DatabaseConnections` blindness in CRA-04.
+
 ---
 
 ## 4. Experiments and findings
@@ -134,11 +136,24 @@ Mis-gating the soft cache dependency inside `/ready` (as if it were hard) and th
 
 #### CRA-04 — One retry layer triples the load, and the metric cannot see it
 
-Wrapping the single DB call in a 3-attempt retry (backoff + full jitter, retryable-only gate) under a DB-path latency fault produced **mean 2.94×** amplification (2.96 / 2.96 / 2.91), baseline exact **1.00**. The **attempt histogram capped at exactly 3** (zero requests exceeded it), excluding the > 3.5× hidden-auto-retry falsifier and pinning the single-layer unit the cascade multiplies. The corroboration was **Corrected**: RDS `DatabaseConnections` stayed flat at the pgxpool ceiling (8) in *both* arms — a resource gauge is structurally blind to attempt amplification above a bounded pool (Little's Law), which only strengthens the count-ratio method. **Verdict: Confirmed · Corrected corroboration.**
+Wrapping the single DB call in a 3-attempt retry (backoff + full jitter, retryable-only gate) under a DB-path latency fault produced **mean 2.94×** amplification (2.96 / 2.96 / 2.91), baseline exact **1.00**. The **attempt histogram capped at exactly 3** (zero requests exceeded it), excluding the > 3.5× hidden-auto-retry falsifier and pinning the single-layer unit the cascade multiplies. The corroboration was **Corrected**: RDS `DatabaseConnections` stayed flat at the pgxpool ceiling (8) in *both* arms. This is **Little's Law** (`L = λ × W`): the pool caps concurrency `L`, so as the fault inflates latency `W`, the DB-call rate `λ` that fits through must fall and the attempts *serialize* — the occupancy gauge stays flat while the count ratio climbs to 3×. The correct saturation signal was never the pool's occupancy but the **queue waiting for it** (acquire-wait). This only strengthens the count-ratio method. **Verdict: Confirmed · Corrected corroboration.**
 
 #### CRA-05 — Three uncoordinated layers multiply to an exact 3 × 3 × 3
 
 Stacking two more independent 3-attempt layers (edge → downstream, and the k6 client) on CRA-04's confirmed single layer produced **mean 26.4×** (25.2 / 27.0 / 27.0, enclosed-request measure), baseline exact **1.00**, every completed cascade decomposing as an exact **3 × 3 × 3**. The instrument was reused *verbatim* from CRA-04, made honest across three hops by **propagating one origin id** (`X-Request-Id` reused by chi's RequestID middleware; `traceparent` by otelhttp) so the denominator stays per-*originating*-request. The 27× is reachable only because every outer timeout is patient enough to let the inner cascade finish — precisely the uncoordinated anti-pattern the number describes. **The canonical headline claim, confirmed on real infrastructure. Verdict: Confirmed.**
+
+```mermaid
+flowchart LR
+    K["k6 client<br/>1 originating request"]
+    L3["Layer 3 · client retry<br/>× 3"]
+    L2["Layer 2 · edge → downstream retry<br/>× 3"]
+    L1["Layer 1 · downstream → DB retry<br/>× 3"]
+    DB[("RDS<br/>3 × 3 × 3 = 27 attempts<br/>from ONE request")]
+    K -->|"1"| L3 -->|"3"| L2 -->|"9"| L1 -->|"27"| DB
+    style DB fill:#742a2a,stroke:#fc8181,color:#fff5f5
+```
+
+*The 3 × 3 × 3 fan-out: each layer retries 3× with no coordination; edge labels are the running total. Measured 26.4× (CRA-05).*
 
 #### CRA-06 — Constraining where retries live collapses the cascade
 
@@ -149,6 +164,22 @@ Deleting the two outer retry layers and gating the single edge → downstream ca
 ## 5. Synthesis — eight takeaways
 
 The two tracks are the same incident seen from two ends: a fail-silent health check keeps a dead target in rotation, and the retries into that target amplify load on the innermost dependency. Detection latency is the hinge.
+
+```mermaid
+flowchart TB
+    M["A compute-resilience mechanism<br/>retry · health check · scaling"]
+    Q{"Is the failure shorter than the<br/>mechanism can outlast or detect?"}
+    P["PROTECTIVE<br/>absorbs the transient blip"]
+    A["AMPLIFIER<br/>compounds the sustained outage"]
+    M --> Q
+    Q -->|"transient"| P
+    Q -->|"sustained"| A
+    P -.->|"same object, opposite sign"| A
+    style P fill:#276749,stroke:#68d391,color:#f0fff4
+    style A fill:#742a2a,stroke:#fc8181,color:#fff5f5
+```
+
+*The sign-flip, one picture: retry → 3× or 27×; health check → evict or black-hole; scaling → absorb or amplify. MTTD is the hinge.*
 
 1. **Liveness is not readiness, and the difference is a fail-silent outage.** A `/health` reporting only "the process is up" keeps a functionally dead task in rotation indefinitely (TTE = ∞, CRA-01). The failure is invisible precisely because the signal everyone trusts stays green.
 2. **Validating the hard dependency closes the gap — but detection is not recovery.** `/ready` evicts the dead target in one health-check budget (CRA-02), yet the wall-clock TTE also carries the fault-delivery latency, and eviction alone does not restore service. Measure end-to-end, and know which term is which.
@@ -210,7 +241,7 @@ aws fis start-experiment --experiment-template-id <DbLatencyTemplateId>
 
 Cite the study, or a specific claim by its stable identifier:
 
-> Nava, A. (2026). *Cascade Resilience Atelier* (v1.0) [Empirical study]. GitHub. https://github.com/ae-lexs/cascade-resilience-atelier
+> Nava, A. (2026). *Cascade Resilience Atelier* (v1.1) [Empirical study]. GitHub. https://github.com/ae-lexs/cascade-resilience-atelier
 
 For a single claim, reference its ID and heading — e.g. **CRA-05 (three uncoordinated retry layers multiply to an exact 3 × 3 × 3 = 26.4×)**. Each `CRA-NN` in §2 is a stable anchor. This atelier is the compute-substrate half of the **Resilience series**; its companion is the [Lambda Resilience Atelier](https://github.com/ae-lexs/lambda-resilience-atelier) (`LRA-NN`), which covers the Lambda concurrency and cold-start failure modes.
 
@@ -238,6 +269,7 @@ MIT.
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.1 | July 2026 | **Folded in the series measurement standard + conceptual figures.** Added the golden-signals → RED+USE, Little's-Law (`L = λ × W`) framing note to §3; expanded CRA-04's pool-blindness into the explicit Little's-Law mechanism (pool caps `L` → attempts serialize → occupancy flat while count ratio climbs; the real saturation signal is the acquire-wait queue). Embedded two Mermaid figures: the 3 × 3 × 3 cascade fan-out (CRA-05) and the sign-flip thesis (mechanism = amplifier; MTTD the hinge). No claim or number changed. |
 | v1.0 | July 2026 | **Citable empirical-study restructure — eight-module arc complete, all six primary claims Confirmed.** Reorganized from the narrative v0.x into the study format: an Abstract framing the work as pre-registered experiment with three verdict labels (Confirmed / Nuanced / Corrected); a **`CRA-NN` claim ledger** (§2) as the citation surface, with the two health-track corrections (detection ≠ recovery; `DatabaseConnections` pool-blindness) surfaced as `Corrected`; an Instruments table (how each number was measured); per-claim findings (§4, CRA-01…06); an eight-point synthesis; the 12-row decisions table; and a **How to cite** section pairing this atelier with the Lambda Resilience Atelier under the Resilience series. Open questions (black-hole, AZ-failure timeline, cascade metastability) stated as owed rather than elided. Numbers: TTE = ∞ (CRA-01); 38.3 s (CRA-02); 2/2/4 vs 0 (CRA-03); 2.94× (CRA-04); 26.4× exact 3×3×3 (CRA-05); 26.4× → 2.94× + 93% shed (CRA-06). |
 | v0.6 | July 2026 | Retry-cascade track complete — Modules 06–08 verdicts (2.94× / 26.4× / 2.94×) folded into the narrative README; synthesis reframed from "open frontier" to proven. |
 | v0.5 | July 2026 | Initial public README (health-check track complete; retry track pre-registered but not yet run). |
